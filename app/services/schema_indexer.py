@@ -14,6 +14,7 @@ from pinecone import Pinecone
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.core import errors
 from app.core.config import settings
 from app.core.security import decrypt
 
@@ -119,6 +120,7 @@ async def index_schema(
     def _sse(payload: dict) -> str:
         return f"data: {json.dumps(payload)}\n\n"
 
+    connecting = True  # errors before inspection finishes come from the user's DB
     try:
         from app.api.endpoints.connections import _to_asyncpg  # avoid circular
 
@@ -130,6 +132,7 @@ async def index_schema(
 
         # 2. Inspect schema
         tables = await _inspect_schema(conn_string)
+        connecting = False
         total = len(tables)
 
         if total == 0:
@@ -208,4 +211,10 @@ async def index_schema(
         yield _sse({"type": "done", "table_count": total})
 
     except Exception as exc:
-        yield _sse({"type": "error", "message": str(exc)})
+        if connecting:
+            logger.warning("Schema inspection failed: %s", errors.exception_summary(exc))
+            message = errors.describe_connection_error(exc)
+        else:
+            logger.exception("Schema indexing failed for namespace %s", namespace)
+            message = errors.INDEXING_FAILED
+        yield _sse({"type": "error", "message": message})

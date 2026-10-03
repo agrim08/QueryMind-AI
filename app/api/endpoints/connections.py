@@ -1,4 +1,5 @@
 """Connections endpoint — CRUD for user DB connections + schema indexing trigger."""
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -17,6 +18,9 @@ from app.models.models import DBConnection, User
 from app.schemas.schemas import DBConnectionCreate, DBConnectionResponse
 from app.services.schema_indexer import index_schema
 
+_CONNECT_TIMEOUT_SECONDS = 10
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -87,23 +91,37 @@ class _TestRequest(BaseModel):
     conn_string: str
 
 
+async def _check_reachable(async_conn_str: str) -> str | None:
+    """Open and close one connection. Returns None on success, else a user-safe message."""
+    try:
+        engine = create_async_engine(
+            async_conn_str,
+            poolclass=NullPool,
+            connect_args={"timeout": _CONNECT_TIMEOUT_SECONDS},
+        )
+    except Exception as exc:  # malformed URL; the message may contain the password
+        logger.info("Connection string rejected: %s", errors.exception_summary(exc))
+        return errors.describe_connection_error(exc)
+
+    try:
+        async with engine.connect():
+            pass
+        return None
+    except Exception as exc:
+        logger.info("Connection test failed: %s", errors.exception_summary(exc))
+        return errors.describe_connection_error(exc)
+    finally:
+        await engine.dispose()
+
+
 @router.post("/test")
 async def test_connection(
     payload: _TestRequest,
     user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
 ) -> dict:
     """Quickly validate that a connection string is reachable (does not persist anything)."""
-    async_conn_str = _to_asyncpg(payload.conn_string)
-    try:
-        from sqlalchemy.ext.asyncio import create_async_engine
-        engine = create_async_engine(async_conn_str, pool_pre_ping=True)
-        async with engine.connect():
-            pass
-        await engine.dispose()
-        return {"ok": True}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
+    error = await _check_reachable(_to_asyncpg(payload.conn_string))
+    return {"ok": True} if error is None else {"ok": False, "error": error}
 
 
 @router.post("/", response_model=DBConnectionResponse, status_code=status.HTTP_201_CREATED)
@@ -129,17 +147,9 @@ async def create_connection(
     async_conn_str = _to_asyncpg(payload.connection_string)
 
     # Test the connection before saving
-    try:
-        from sqlalchemy.ext.asyncio import create_async_engine
-        test_engine = create_async_engine(async_conn_str, pool_pre_ping=True)
-        async with test_engine.connect():
-            pass
-        await test_engine.dispose()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Could not connect to database: {exc}",
-        )
+    error = await _check_reachable(async_conn_str)
+    if error is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error)
 
     namespace = f"user-{current_user.id}-conn-{uuid.uuid4().hex[:8]}"
     connection = DBConnection(

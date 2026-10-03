@@ -45,6 +45,56 @@ class TestBlocklist:
         assert not result.is_valid
 
 
+class TestSideEffectingSelects:
+    """SELECTs that would still change state or harm the user's database."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * INTO backup_users FROM users",
+            "SELECT id FROM orders FOR SHARE",
+            "SELECT id FROM orders FOR NO KEY UPDATE",
+            "SELECT id FROM orders FOR KEY SHARE",
+            "SELECT id FROM orders FOR UPDATE",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity",
+            "SELECT pg_cancel_backend(42)",
+            "SELECT pg_sleep(30)",
+            "SELECT pg_sleep_for('1 minute')",
+            "SELECT nextval('orders_id_seq')",
+            "SELECT setval('orders_id_seq', 1)",
+            "SELECT set_config('search_path', 'evil', false)",
+            "SELECT * FROM dblink('host=10.0.0.5', 'SELECT 1') AS t(x int)",
+            "SELECT lo_import('/etc/passwd')",
+            "SELECT pg_read_file('/etc/passwd')",
+            "SELECT pg_ls_dir('.')",
+            "SELECT pg_advisory_lock(1)",
+            "SELECT query_to_xml('SELECT 1', true, true, '')",
+            "SELECT PG_SLEEP (5)",
+        ],
+    )
+    def test_blocked(self, sql):
+        result = validate_sql(sql)
+        assert not result.is_valid, sql
+
+
+class TestNoFalsePositives:
+    """Ordinary read queries that resemble blocked patterns must still pass."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT "into_date", "lo_value", "sleep_hours" FROM metrics',
+            "SELECT LOWER(name) FROM users",
+            "SELECT pg_size_pretty(pg_total_relation_size('users'))",
+            'SELECT "for_share_count" FROM stats',
+            "SELECT COUNT(*) FROM users WHERE shared = true",
+        ],
+    )
+    def test_allowed(self, sql):
+        result = validate_sql(sql)
+        assert result.is_valid, f"{sql} -> {result.error}"
+
+
 class TestValidSelects:
     def test_simple_select(self):
         result = validate_sql("SELECT * FROM users")

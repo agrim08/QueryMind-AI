@@ -55,9 +55,15 @@ async def generate_schema(
         await db.commit()
 
         return schema
-    except Exception as e:
-        logger.error(f"Error generating schema: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Schema generation failed for user %s", current_user.id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=errors.DESIGN_FAILED,
+        )
+
 
 @router.get("/history")
 async def get_design_history(
@@ -73,8 +79,8 @@ async def get_design_history(
             .order_by(DesignLog.created_at.desc())
         )
         return result.scalars().all()
-    except Exception as e:
-        logger.error(f"Error fetching design history: {e}", exc_info=True)
+    except Exception:
+        logger.exception("Fetching design history failed for user %s", current_user.id)
         raise HTTPException(status_code=500, detail="Could not fetch design history")
 
 

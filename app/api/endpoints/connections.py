@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user_with_entitlements, Entitlements
+from app.core import errors
 from app.core.security import encrypt, decrypt
 from app.db.session import get_db
 from app.models.models import DBConnection, User
@@ -70,9 +72,10 @@ def _to_asyncpg(conn_str: str) -> str:
 
 @router.get("/", response_model=list[DBConnectionResponse])
 async def list_connections(
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
     db: AsyncSession = Depends(get_db),
 ) -> list[DBConnectionResponse]:
+    current_user, _ = user_and_ent
     result = await db.execute(
         select(DBConnection).where(DBConnection.user_id == current_user.id)
     )
@@ -87,7 +90,7 @@ class _TestRequest(BaseModel):
 @router.post("/test")
 async def test_connection(
     payload: _TestRequest,
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
 ) -> dict:
     """Quickly validate that a connection string is reachable (does not persist anything)."""
     async_conn_str = _to_asyncpg(payload.conn_string)
@@ -106,13 +109,23 @@ async def test_connection(
 @router.post("/", response_model=DBConnectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_connection(
     payload: DBConnectionCreate,
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
     db: AsyncSession = Depends(get_db),
 ) -> DBConnectionResponse:
-    """Create a new DB connection. The connection string is Fernet-encrypted before storage."""
+    """Create a new DB connection. Enforces plan connection limits before saving."""
+    current_user, entitlements = user_and_ent
+
+    # Enforce plan connection limit
+    existing_count = await db.scalar(
+        select(func.count(DBConnection.id)).where(DBConnection.user_id == current_user.id)
+    )
+    if (existing_count or 0) >= entitlements.max_connections:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CONNECTION_LIMIT_REACHED",
+        )
 
     # Normalise the scheme so the async engine always uses asyncpg.
-    # Users typically paste postgresql:// or postgres:// — both need +asyncpg for async SQLAlchemy.
     async_conn_str = _to_asyncpg(payload.connection_string)
 
     # Test the connection before saving
@@ -132,7 +145,6 @@ async def create_connection(
     connection = DBConnection(
         user_id=current_user.id,
         name=payload.name,
-        # Store the normalised async-compatible string so we can use it for indexing too
         encrypted_conn_string=encrypt(async_conn_str),
         pinecone_namespace=namespace,
     )
@@ -146,9 +158,10 @@ async def create_connection(
 @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_connection(
     connection_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    current_user, _ = user_and_ent
     result = await db.execute(
         select(DBConnection).where(
             DBConnection.id == connection_id,
@@ -165,10 +178,11 @@ async def delete_connection(
 @router.post("/{connection_id}/index")
 async def trigger_indexing(
     connection_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Trigger schema indexing for a connection. Streams SSE progress events."""
+    current_user, _ = user_and_ent
     result = await db.execute(
         select(DBConnection).where(
             DBConnection.id == connection_id,

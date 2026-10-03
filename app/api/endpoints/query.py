@@ -1,15 +1,17 @@
 """Query endpoint — SSE pipeline: retrieve schema → stream SQL → validate → execute → log."""
 import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user_with_entitlements, Entitlements
+from app.core import errors
 from app.db.session import get_db
 from app.models.models import DBConnection, QueryLog, User
 from app.schemas.schemas import QueryRequest
@@ -18,6 +20,9 @@ from app.services.schema_retriever import retrieve_schema
 from app.services.sql_generator import stream_sql
 from app.services.sql_validator import validate_sql
 
+_UNLIMITED = 999_999_999
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -29,7 +34,7 @@ def _sse(payload: dict) -> str:
 @router.post("/")
 async def run_query(
     payload: QueryRequest,
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """
@@ -42,6 +47,24 @@ async def run_query(
       {"type": "done"}
       {"type": "error", "message": "..."}
     """
+    current_user, entitlements = user_and_ent
+
+    # Enforce monthly query limit for non-unlimited plans
+    if entitlements.max_queries_pm < _UNLIMITED:
+        now = datetime.now(timezone.utc)
+        month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        monthly_count = await db.scalar(
+            select(func.count(QueryLog.id)).where(
+                QueryLog.user_id == current_user.id,
+                QueryLog.created_at >= month_start,
+            )
+        )
+        if (monthly_count or 0) >= entitlements.max_queries_pm:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="QUERY_LIMIT_REACHED",
+            )
+
     # Validate connection ownership
     result = await db.execute(
         select(DBConnection).where(
@@ -173,12 +196,13 @@ async def get_history(
     connection_id: uuid.UUID | None = None,
     page: int = 1,
     page_size: int = 20,
-    current_user: User = Depends(get_current_user),
+    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
     db: AsyncSession = Depends(get_db),
 ):
     """Paginated query history for the current user."""
     from app.schemas.schemas import QueryLogResponse
 
+    current_user, _ = user_and_ent
     query = select(QueryLog).where(QueryLog.user_id == current_user.id)
     if connection_id:
         query = query.where(QueryLog.connection_id == connection_id)

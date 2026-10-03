@@ -2,7 +2,9 @@
 
 Hard rules:
 - Only SELECT statements are allowed.
-- Blocklist covers all mutating / DDL keywords.
+- Blocklist covers all mutating / DDL keywords, SELECT ... INTO, row locks,
+  and side-effecting functions (pg_terminate_backend, pg_sleep, dblink, ...).
+- This is one layer of several: the executor also runs inside a READ ONLY transaction.
 - Table names in the query must exist in the provided schema.
 """
 import re
@@ -32,7 +34,23 @@ _BLOCKLIST: frozenset[str] = frozenset(
         "COPY",
         "VACUUM",
         "ANALYZE",
+        "INTO",  # SELECT ... INTO creates a table
     }
+)
+
+# Row-locking clauses (FOR UPDATE is already caught by the UPDATE keyword).
+_ROW_LOCK_PATTERN = re.compile(r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|KEY\s+SHARE|SHARE)\b")
+
+# Functions with side effects that a SELECT can call. The executor's READ ONLY
+# transaction stops writes, but not these (killing sessions, sleeping, reading
+# server files, opening connections elsewhere, or running SQL hidden in a string).
+_FORBIDDEN_FUNCTION_PATTERN = re.compile(
+    r"\b("
+    r"PG_SLEEP\w*|PG_TERMINATE_BACKEND|PG_CANCEL_BACKEND|PG_RELOAD_CONF|"
+    r"PG_ROTATE_LOGFILE|PG_SWITCH_WAL|PG_CREATE_\w+|PG_DROP_\w+|PG_NOTIFY|"
+    r"PG_(?:TRY_)?ADVISORY\w*|PG_READ_\w+|PG_LS_\w+|PG_STAT_FILE|"
+    r"LO_\w+|DBLINK\w*|SET_CONFIG|NEXTVAL|SETVAL|QUERY_TO_\w+|CURSOR_TO_\w+"
+    r")\s*\("
 )
 
 
@@ -84,6 +102,22 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
                 is_valid=False,
                 error=f"Forbidden keyword detected: {keyword}. Only SELECT queries are allowed.",
             )
+
+    if _ROW_LOCK_PATTERN.search(upper_sql):
+        return ValidationResult(
+            is_valid=False,
+            error="Row-locking clauses (FOR SHARE / FOR UPDATE) are not allowed.",
+        )
+
+    function_match = _FORBIDDEN_FUNCTION_PATTERN.search(upper_sql)
+    if function_match:
+        return ValidationResult(
+            is_valid=False,
+            error=(
+                f"Forbidden function detected: {function_match.group(1).lower()}. "
+                "Only read-only queries are allowed."
+            ),
+        )
 
     # --- 2. Parse and verify it's a single SELECT statement ---
     parsed = sqlparse.parse(sql)

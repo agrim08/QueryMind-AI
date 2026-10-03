@@ -26,12 +26,9 @@ async def _get_jwks() -> dict:
     return _jwks_cache
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
-) -> User:
-    """Verify Clerk JWT, extract clerk_id, and return the DB user."""
-    token = credentials.credentials
+async def _decode_token(token: str) -> dict:
+    """Decode and verify the Clerk JWT, returning the full payload."""
+    global _jwks_cache
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -39,18 +36,43 @@ async def get_current_user(
     )
     try:
         jwks = await _get_jwks()
-        payload = jwt.decode(
+        return jwt.decode(
             token,
             jwks,
             algorithms=["RS256"],
             options={"verify_aud": False},
             issuer=settings.CLERK_ISSUER,
         )
-        clerk_id: str | None = payload.get("sub")
-        if clerk_id is None:
-            raise credentials_exception
     except JWTError:
-        raise credentials_exception
+        # Retry once with a fresh JWKS in case the key rotated
+        _jwks_cache = None
+        try:
+            jwks = await _get_jwks()
+            return jwt.decode(
+                token,
+                jwks,
+                algorithms=["RS256"],
+                options={"verify_aud": False},
+                issuer=settings.CLERK_ISSUER,
+            )
+        except JWTError:
+            raise credentials_exception
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Verify Clerk JWT, extract clerk_id, and return the DB user."""
+    payload = await _decode_token(credentials.credentials)
+
+    clerk_id: str | None = payload.get("sub")
+    if clerk_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     result = await db.execute(select(User).where(User.clerk_id == clerk_id))
     user = result.scalar_one_or_none()

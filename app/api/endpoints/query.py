@@ -15,7 +15,7 @@ from app.core import errors
 from app.db.session import get_db
 from app.models.models import DBConnection, QueryLog, User
 from app.schemas.schemas import QueryRequest
-from app.services.query_executor import execute_query
+from app.services.query_executor import STATEMENT_TIMEOUT_MS, execute_query
 from app.services.schema_retriever import retrieve_schema
 from app.services.sql_generator import stream_sql
 from app.services.sql_validator import validate_sql
@@ -24,6 +24,17 @@ _UNLIMITED = 999_999_999
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _describe_pipeline_error(exc: Exception, step: str) -> str:
+    """Map a pipeline failure to a user-safe message based on the step that failed."""
+    if step == "retrieve":
+        return errors.SCHEMA_LOOKUP_FAILED
+    if step == "generate":
+        return errors.GENERATION_FAILED
+    if step == "execute":
+        return errors.describe_query_error(exc, STATEMENT_TIMEOUT_MS // 1000)
+    return errors.INTERNAL_ERROR
 
 
 def _sse(payload: dict) -> str:
@@ -43,9 +54,10 @@ async def run_query(
     Events:
       {"type": "status", "message": "..."}
       {"type": "sql_chunk", "chunk": "..."}
-      {"type": "results", "columns": [...], "rows": [...], "exec_time_ms": N, "row_count": N}
+      {"type": "results", "columns": [...], "rows": [...], "exec_time_ms": N, "row_count": N,
+       "truncated": bool}   # truncated: the query had more than MAX_ROWS rows
       {"type": "done"}
-      {"type": "error", "message": "..."}
+      {"type": "error", "message": "..."}  # always user-safe; details go to server logs
     """
     current_user, entitlements = user_and_ent
 
@@ -87,6 +99,7 @@ async def run_query(
         exec_result = None
         error_msg = None
         status_val = "pending"
+        step = "retrieve"
 
         try:
             # Step 1: Retrieve relevant schema
@@ -97,6 +110,7 @@ async def run_query(
             known_tables = [doc.table_name for doc in table_docs]
 
             # Step 2: Stream SQL generation
+            step = "generate"
             yield _sse({"type": "status", "message": "Generating SQL..."})
             async for chunk in stream_sql(payload.nl_query, table_docs):
                 generated_sql += chunk
@@ -105,6 +119,7 @@ async def run_query(
             generated_sql = generated_sql.strip()
 
             # Step 3: Validate
+            step = "validate"
             yield _sse({"type": "status", "message": "Validating SQL..."})
             validation = validate_sql(generated_sql, known_tables=known_tables)
             if not validation.is_valid:
@@ -114,6 +129,7 @@ async def run_query(
                 return
 
             # Step 4: Execute
+            step = "execute"
             yield _sse({"type": "status", "message": "Executing query..."})
             exec_result = await execute_query(
                 connection.encrypted_conn_string, generated_sql
@@ -127,16 +143,24 @@ async def run_query(
                     "rows": exec_result.rows,
                     "exec_time_ms": exec_result.exec_time_ms,
                     "row_count": exec_result.row_count,
+                    "truncated": exec_result.truncated,
                 }
             )
             yield _sse({"type": "done"})
 
         except Exception as exc:
-            import traceback
-            error_msg = str(exc)
+            # The user (and their history) gets a safe message; logs get the detail.
+            error_msg = _describe_pipeline_error(exc, step)
             status_val = "error"
-            # Print full traceback so it appears in uvicorn logs
-            traceback.print_exc()
+            if step == "execute":
+                # Target-DB errors are expected (bad SQL, timeouts); no traceback needed.
+                logger.warning(
+                    "Query execution failed (connection %s): %s",
+                    connection.id,
+                    errors.exception_summary(exc),
+                )
+            else:
+                logger.exception("Query pipeline failed at step %r (connection %s)", step, connection.id)
             yield _sse({"type": "error", "message": error_msg})
 
         finally:

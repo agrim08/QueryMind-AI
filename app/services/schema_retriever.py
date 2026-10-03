@@ -8,7 +8,7 @@ from pinecone import Pinecone
 
 from app.core.config import settings
 
-EMBEDDING_MODEL = "models/gemini-embedding-001"
+EMBEDDING_MODEL = "models/gemini-embedding-002"
 TOP_K = 6
 
 

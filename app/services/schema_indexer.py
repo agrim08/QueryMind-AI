@@ -4,6 +4,7 @@ Streams progress events as an async generator of SSE-compatible strings.
 """
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
@@ -16,7 +17,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.core.config import settings
 from app.core.security import decrypt
 
-EMBEDDING_MODEL = "models/gemini-embedding-001"
+logger = logging.getLogger(__name__)
+
+EMBEDDING_MODEL = "models/gemini-embedding-002"
 EMBEDDING_DIMENSIONS = 3072
 
 

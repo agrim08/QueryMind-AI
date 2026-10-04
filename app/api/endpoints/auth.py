@@ -1,44 +1,26 @@
-"""Auth endpoint — upserts a Clerk user into the Neon DB on first login."""
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+"""Auth endpoint — mirrors the signed-in Clerk user into the application database."""
+from fastapi import APIRouter
 
-from app.db.session import get_db
-from app.models.models import User
-from app.schemas.schemas import UserSyncRequest, UserResponse
+from app.api.deps import TokenClaims
+from app.db.session import DbSession
+from app.schemas.schemas import UserResponse, UserSyncRequest
+from app.services import users as user_service
 
 router = APIRouter()
 
 
-@router.post("/sync", response_model=UserResponse, status_code=status.HTTP_200_OK)
-async def sync_user(
-    payload: UserSyncRequest,
-    db: AsyncSession = Depends(get_db),
-) -> UserResponse:
+@router.post("/sync", response_model=UserResponse)
+async def sync_user(payload: UserSyncRequest, claims: TokenClaims, db: DbSession) -> UserResponse:
+    """Create or update the current user. Idempotent — safe to call on every sign-in.
+
+    The Clerk user id comes from the verified token, so a caller can only ever
+    create or update their own record.
     """
-    Upsert a user record from Clerk into the application database.
-
-    Called once after login from the frontend. Idempotent — safe to call multiple times.
-    """
-    result = await db.execute(select(User).where(User.clerk_id == payload.clerk_id))
-    user = result.scalar_one_or_none()
-
-    if user is None:
-        user = User(
-            clerk_id=payload.clerk_id,
-            email=payload.email,
-            full_name=payload.full_name,
-            avatar_url=payload.avatar_url,
-        )
-        db.add(user)
-    else:
-        # Update mutable fields on subsequent syncs
-        user.email = payload.email
-        if payload.full_name is not None:
-            user.full_name = payload.full_name
-        if payload.avatar_url is not None:
-            user.avatar_url = payload.avatar_url
-
-    await db.commit()
-    await db.refresh(user)
+    user = await user_service.upsert_from_clerk(
+        db,
+        clerk_id=claims["sub"],
+        email=payload.email,
+        full_name=payload.full_name,
+        avatar_url=payload.avatar_url,
+    )
     return UserResponse.model_validate(user)

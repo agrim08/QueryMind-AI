@@ -1,23 +1,39 @@
-"""FastAPI dependency — verifies Clerk JWT and loads the current user."""
+"""FastAPI dependencies: authentication, plan entitlements, ownership and quotas.
+
+Use the Annotated aliases in endpoint signatures:
+
+    async def endpoint(user: CurrentUser, plan: Plan, db: DbSession): ...
+
+and plan limits as route dependencies:
+
+    @router.post("/", dependencies=[Depends(require_query_quota)])
+
+FastAPI resolves each dependency once per request, so the JWT is verified once even
+when several dependencies need its claims.
+"""
+import uuid
 from dataclasses import dataclass
+from typing import Annotated, Any
 
 import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.session import get_db
-from app.models.models import User
+from app.core.exceptions import LimitReached
+from app.db.session import DbSession
+from app.models.models import DBConnection, User
+from app.services import connections as connection_service
+from app.services import usage
 
 bearer_scheme = HTTPBearer()
 
 # Simple in-memory JWKS cache (refreshed on decode failure)
 _jwks_cache: dict | None = None
 
-_UNLIMITED = 999_999_999
+UNLIMITED = 999_999_999
 
 
 @dataclass(frozen=True)
@@ -42,12 +58,12 @@ def _build_entitlements(payload: dict) -> Entitlements:
     is_pro = is_team or "pro_tier" in features
 
     if is_team:
-        max_connections = _UNLIMITED
-        max_queries_pm = _UNLIMITED
-        max_designs_pm = _UNLIMITED
+        max_connections = UNLIMITED
+        max_queries_pm = UNLIMITED
+        max_designs_pm = UNLIMITED
     elif is_pro:
         max_connections = 5
-        max_queries_pm = _UNLIMITED
+        max_queries_pm = UNLIMITED
         max_designs_pm = 6
     else:
         max_connections = 1
@@ -66,6 +82,16 @@ def _build_entitlements(payload: dict) -> Entitlements:
     )
 
 
+# ── Token verification ────────────────────────────────────────────────────────
+
+def _unauthorized() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 async def _get_jwks() -> dict:
     global _jwks_cache
     if _jwks_cache is None:
@@ -76,56 +102,42 @@ async def _get_jwks() -> dict:
     return _jwks_cache
 
 
-async def _decode_token(token: str) -> dict:
-    """Decode and verify the Clerk JWT, returning the full payload."""
-    global _jwks_cache
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+def _decode(token: str, jwks: dict) -> dict:
+    return jwt.decode(
+        token, jwks, algorithms=["RS256"], options={"verify_aud": False}, issuer=settings.CLERK_ISSUER
     )
+
+
+async def _decode_token(token: str) -> dict:
+    """Decode and verify the Clerk JWT, retrying once with fresh keys after a rotation."""
+    global _jwks_cache
     try:
-        jwks = await _get_jwks()
-        return jwt.decode(
-            token,
-            jwks,
-            algorithms=["RS256"],
-            options={"verify_aud": False},
-            issuer=settings.CLERK_ISSUER,
-        )
+        return _decode(token, await _get_jwks())
     except JWTError:
-        # Retry once with a fresh JWKS in case the key rotated
         _jwks_cache = None
         try:
-            jwks = await _get_jwks()
-            return jwt.decode(
-                token,
-                jwks,
-                algorithms=["RS256"],
-                options={"verify_aud": False},
-                issuer=settings.CLERK_ISSUER,
-            )
+            return _decode(token, await _get_jwks())
         except JWTError:
-            raise credentials_exception
+            raise _unauthorized() from None
 
 
-async def get_current_user(
+async def get_token_claims(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
-) -> User:
-    """Verify Clerk JWT, extract clerk_id, and return the DB user."""
-    payload = await _decode_token(credentials.credentials)
+) -> dict[str, Any]:
+    """Verified JWT claims. `sub` (the Clerk user id) is guaranteed to be present."""
+    claims = await _decode_token(credentials.credentials)
+    if not claims.get("sub"):
+        raise _unauthorized()
+    return claims
 
-    clerk_id: str | None = payload.get("sub")
-    if clerk_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
-    result = await db.execute(select(User).where(User.clerk_id == clerk_id))
-    user = result.scalar_one_or_none()
+TokenClaims = Annotated[dict[str, Any], Depends(get_token_claims)]
+
+
+# ── Current user and plan ─────────────────────────────────────────────────────
+
+async def get_current_user(claims: TokenClaims, db: DbSession) -> User:
+    user = await db.scalar(select(User).where(User.clerk_id == claims["sub"]))
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -134,28 +146,36 @@ async def get_current_user(
     return user
 
 
-async def get_current_user_with_entitlements(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
-) -> tuple[User, Entitlements]:
-    """Like get_current_user but also returns the resolved Entitlements from the JWT."""
-    payload = await _decode_token(credentials.credentials)
+def get_entitlements(claims: TokenClaims) -> Entitlements:
+    return _build_entitlements(claims)
 
-    clerk_id: str | None = payload.get("sub")
-    if clerk_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
-    result = await db.execute(select(User).where(User.clerk_id == clerk_id))
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found — call /api/v1/users/sync first",
-        )
+CurrentUser = Annotated[User, Depends(get_current_user)]
+Plan = Annotated[Entitlements, Depends(get_entitlements)]
 
-    entitlements = _build_entitlements(payload)
-    return user, entitlements
+
+# ── Ownership ─────────────────────────────────────────────────────────────────
+
+async def get_owned_connection(connection_id: uuid.UUID, user: CurrentUser, db: DbSession) -> DBConnection:
+    """The `{connection_id}` path parameter, resolved only if the current user owns it."""
+    return await connection_service.get_for_user(db, user.id, connection_id)
+
+
+OwnedConnection = Annotated[DBConnection, Depends(get_owned_connection)]
+
+
+# ── Plan limits (use as route dependencies) ───────────────────────────────────
+
+async def require_query_quota(user: CurrentUser, plan: Plan, db: DbSession) -> None:
+    if plan.max_queries_pm < UNLIMITED and await usage.count_questions_this_month(db, user.id) >= plan.max_queries_pm:
+        raise LimitReached("QUERY_LIMIT_REACHED")
+
+
+async def require_design_quota(user: CurrentUser, plan: Plan, db: DbSession) -> None:
+    if plan.max_designs_pm < UNLIMITED and await usage.count_designs_this_month(db, user.id) >= plan.max_designs_pm:
+        raise LimitReached("DESIGN_LIMIT_REACHED")
+
+
+async def require_connection_slot(user: CurrentUser, plan: Plan, db: DbSession) -> None:
+    if await usage.count_connections(db, user.id) >= plan.max_connections:
+        raise LimitReached("CONNECTION_LIMIT_REACHED")

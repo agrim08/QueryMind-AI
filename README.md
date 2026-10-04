@@ -98,6 +98,25 @@ Foreign Keys:
 - (customer_id) -> customer(customer_id)
 ```
 
+## Business knowledge and conversations
+
+Every company uses its own words: "revenue" might mean paid orders only, "active" might mean
+logged in this month. QueryMind learns them per connection, and still makes one AI call per question:
+
+- **Business description:** typed, pasted or dictated (browser speech recognition), or drafted by
+  the AI from the schema. One setup call turns it into short **definitions** (metrics, terms,
+  default filters, conventions, table notes) and starter questions, which the user reviews and edits.
+- **Per question, only the relevant definitions** go into the prompt, like short "evidence"
+  sentences (the BIRD benchmark measured +20 points of accuracy from such hints). Answers to
+  clarifying questions are remembered as definitions, so they aren't asked twice.
+- **Verified answers (👍):** the question and its SQL are saved; similar later questions get them as
+  worked examples (pg_trgm similarity in Postgres, no embedding call), and a close match is shown
+  as "Based on your verified answer to …".
+- **Follow-ups:** "now only Europe" carries the previous one or two questions and their SQL.
+
+All of it is untrusted input: length-capped, in the user turn only, and the SQL it influences still
+goes through the validator and the read-only executor. Setup calls are capped per connection per day.
+
 ## Safety model
 
 QueryMind runs AI-written SQL on people's own databases, so no single layer is trusted:
@@ -175,7 +194,11 @@ All routes are under `/api/v1` and require a Clerk JWT.
 | `POST /connections/test` | Test a connection URL without saving it |
 | `POST /connections/{id}/index` | Index the schema (SSE: `status`, `progress`, `done`, `error`) |
 | `POST /query/` | Ask a question (SSE: `status`, `sql_chunk`, `retry`, `results`, `clarify`, `message`, `done`, `error`); send `clarification: {question_id, answer}` to answer a `clarify` |
-| `GET /query/history` | Past questions, paginated |
+| `GET /query/history` | Past questions: `{items, total}` |
+| `POST /query/{question_id}/verify` | 👍: save an answered question and its SQL as verified |
+| `GET /connections/{id}/knowledge` | Business description, definitions, verified answers, starter questions |
+| `PUT …/knowledge/description` · `POST …/knowledge/draft` · `POST …/knowledge/extract` | Save the description; AI draft from the schema; extract definitions and starter questions |
+| `POST …/knowledge/items` · `PATCH`/`DELETE …/knowledge/items/{item_id}` · `DELETE …/knowledge/verified/{id}` | Manage definitions and verified answers |
 | `POST /design/generate-schema` · `GET /design/history` · `GET /design/usage` | Schema Designer |
 
 Plan limits return `403` with `CONNECTION_LIMIT_REACHED`, `QUERY_LIMIT_REACHED` or `DESIGN_LIMIT_REACHED`.

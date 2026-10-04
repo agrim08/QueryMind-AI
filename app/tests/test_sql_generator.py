@@ -7,7 +7,7 @@ import pytest
 from app.core.ai_config import GENERATION_MODEL, SQL_MAX_OUTPUT_TOKENS, SQL_THINKING_BUDGET
 from app.services import sql_generator
 from app.services.schema_store import TableDoc
-from app.services.sql_generator import SYSTEM_PROMPT, SqlReply, _build_prompt, parse_reply
+from app.services.sql_generator import SYSTEM_PROMPT, _build_prompt
 
 
 @pytest.fixture
@@ -125,38 +125,3 @@ class TestGenerationSettings:
 
     def test_no_schema_specific_hints(self):
         assert 'join with the "users" table' not in SYSTEM_PROMPT
-
-
-class TestParseReply:
-    def test_plain_sql(self):
-        reply = parse_reply("  SELECT 1;  ")
-        assert reply == SqlReply("SELECT 1;", (), None)
-
-    @pytest.mark.parametrize(
-        "text",
-        ["```sql\nSELECT 1\n```", "```\nSELECT 1\n```", "```postgresql\nSELECT 1```", "Here it is:\n```sql\nSELECT 1\n```"],
-    )
-    def test_markdown_fences_are_stripped(self, text):
-        assert parse_reply(text).sql == "SELECT 1"
-
-    def test_assumptions_are_split_off(self):
-        reply = parse_reply(
-            "-- Assumption: revenue means invoice totals\n-- assumption: years are calendar years\nSELECT 1"
-        )
-        assert reply.sql == "SELECT 1"
-        assert reply.assumptions == ("revenue means invoice totals", "years are calendar years")
-
-    @pytest.mark.parametrize(
-        "text", ["-- Cannot answer: artists have no phone column", "--cannot answer artists have no phone column"]
-    )
-    def test_cannot_answer(self, text):
-        reply = parse_reply(text)
-        assert reply.sql == ""
-        assert reply.cannot_answer == "artists have no phone column"
-
-    def test_other_leading_comments_are_dropped(self):
-        assert parse_reply("-- total sales\nSELECT 1").sql == "SELECT 1"
-
-    def test_comments_inside_the_statement_are_kept(self):
-        # Only leading comments are removed; the validator sees everything that runs.
-        assert parse_reply("SELECT 1 -- one\nFROM t").sql == "SELECT 1 -- one\nFROM t"

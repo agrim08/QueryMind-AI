@@ -94,10 +94,23 @@ def _without_expression_from(sql: str) -> str:
     return "".join(chars)
 
 
+def table_references(sql: str) -> list[tuple[str, ...]]:
+    """The tables a query reads, as lowercased name parts: ("invoice",) or ("sales", "orders").
+
+    Only real references (after FROM / JOIN), not FROM inside expressions or string literals.
+    """
+    return [
+        tuple(part.strip('"').lower() for part in (match.group(1) or match.group(2)).split("."))
+        for match in _TABLE_REFERENCE_PATTERN.finditer(_without_expression_from(sql))
+    ]
+
+
 @dataclass
 class ValidationResult:
     is_valid: bool
     error: str | None = None
+    # Tables the query references that weren't in known_tables (lowercased display names).
+    unknown_tables: tuple[str, ...] = ()
 
 
 def _extract_keywords(statement: Statement) -> list[str]:
@@ -184,8 +197,7 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
         known_lower = {t.lower() for t in known_tables}
         known_bare = {t.split(".")[-1] for t in known_lower}
         unknown = set()
-        for match in _TABLE_REFERENCE_PATTERN.finditer(_without_expression_from(sql)):
-            parts = [part.strip('"').lower() for part in (match.group(1) or match.group(2)).split(".")]
+        for parts in table_references(sql):
             if len(parts) == 1:
                 # A bare name may refer to a listed table in any schema.
                 listed = parts[0] in known_bare
@@ -199,6 +211,7 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
             return ValidationResult(
                 is_valid=False,
                 error=f"Query references unknown table(s): {', '.join(sorted(unknown))}",
+                unknown_tables=tuple(sorted(unknown)),
             )
 
     return ValidationResult(is_valid=True)

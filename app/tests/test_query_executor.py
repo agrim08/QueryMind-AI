@@ -9,13 +9,16 @@ Use a throwaway database: the tests prove writes are rejected, so nothing is wri
 """
 import asyncio
 import os
+from contextlib import asynccontextmanager
 
 import asyncpg.exceptions as pg_errors
 import pytest
 
 from app.core import errors
+from app.core.config import settings
 from app.services import query_executor
 from app.services.query_executor import MAX_ROWS, execute_query
+from app.services.target_db import normalize_url
 
 
 # ── Fake engine (unit tests) ──────────────────────────────────────────────────
@@ -73,8 +76,16 @@ class _FakeEngine:
 def fake_engine(monkeypatch):
     def install(total_rows: int) -> _FakeEngine:
         engine = _FakeEngine(total_rows)
-        monkeypatch.setattr(query_executor, "decrypt", lambda token: token)
-        monkeypatch.setattr(query_executor, "create_async_engine", lambda *a, **k: engine)
+
+        @asynccontextmanager
+        async def fake_open_target_engine(url):
+            try:
+                yield engine
+            finally:
+                await engine.dispose()
+
+        monkeypatch.setattr(query_executor, "decrypt_url", lambda token: token)
+        monkeypatch.setattr(query_executor, "open_target_engine", fake_open_target_engine)
         return engine
 
     return install
@@ -141,7 +152,9 @@ requires_db = pytest.mark.skipif(
 
 @pytest.fixture
 def plain_decrypt(monkeypatch):
-    monkeypatch.setattr(query_executor, "decrypt", lambda token: token)
+    """Use the URL as given (no encryption) and allow the local test host."""
+    monkeypatch.setattr(query_executor, "decrypt_url", normalize_url)
+    monkeypatch.setattr(settings, "ALLOW_PRIVATE_DB_HOSTS", True)
 
 
 def _run(sql: str):

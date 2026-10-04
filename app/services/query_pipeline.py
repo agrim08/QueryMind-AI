@@ -7,7 +7,9 @@
   {"type": "results",   "sql": "...", "columns": [...], "rows": [...], "exec_time_ms": N,
                         "row_count": N, "truncated": bool,
                         "answer": {intent, understood, assumptions, alternatives, follow_ups,
-                                   headline, chart}}        # see answer_presentation
+                                   headline, chart},        # see answer_presentation
+                        "verified_match": "..." | null,     # a close verified question used
+                        "knowledge_used": [...]}            # names of definitions sent
   {"type": "clarify",   "question": "...", "options": [...], "understood": "..."}
   {"type": "message",   "text": "..."}        # a plain answer about the database itself
   {"type": "done"}
@@ -31,8 +33,10 @@ from typing import Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import errors
-from app.services import schema_answers
+from app.services import schema_answers, verified_queries
 from app.services.answer_presentation import Presentation, present
+from app.services.prompt_context import PromptContext, select_knowledge
+from app.services.question_context import QuestionContext
 from app.services.query_executor import STATEMENT_TIMEOUT_MS, QueryResult, execute_query
 from app.services.reply_format import SqlReply, SqlStreamFilter, parse_reply
 from app.services.schema_retriever import retrieve_schema
@@ -95,8 +99,11 @@ async def run_pipeline(
     question: str,
     outcome: PipelineOutcome,
     clarification: str | None = None,
+    context: QuestionContext | None = None,
 ) -> AsyncIterator[dict]:
-    """Answer `question`; `clarification` is the user's answer to a clarifying question."""
+    """Answer `question`; `clarification` is the user's answer to a clarifying question, and
+    `context` the connection's knowledge, verified examples and conversation (question_context)."""
+    context = context or QuestionContext()
     step: Step = "retrieve"
     try:
         if clarification is None and schema_answers.is_table_listing(question):
@@ -109,6 +116,12 @@ async def run_pipeline(
 
         yield {"type": "status", "message": "Retrieving schema context..."}
         table_docs = await retrieve_schema(session, connection_id, question)
+        prompt_context = PromptContext(
+            knowledge=tuple(select_knowledge(list(context.knowledge), question, [d.table_name for d in table_docs])),
+            examples=context.examples,
+            turns=context.turns,
+        )
+        strong = [e for e in context.examples if e.similarity >= verified_queries.STRONG_MATCH]
 
         feedback: RetryFeedback | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -120,7 +133,7 @@ async def run_pipeline(
                 yield {"type": "retry", "message": "Fixing the query..."}
             outcome.generated_sql = ""
             shown = SqlStreamFilter()
-            async for chunk in stream_sql(question, table_docs, feedback, clarification):
+            async for chunk in stream_sql(question, table_docs, feedback, clarification, prompt_context):
                 outcome.generated_sql += chunk
                 if sql_text := shown.feed(chunk):
                     yield {"type": "sql_chunk", "chunk": sql_text}
@@ -199,6 +212,9 @@ async def run_pipeline(
                 "row_count": result.row_count,
                 "truncated": result.truncated,
                 "answer": _presentation(reply, result).to_dict(),
+                # The user's own verified question this answer was based on, when one was close.
+                "verified_match": strong[0].question if strong else None,
+                "knowledge_used": [e.name for e in prompt_context.knowledge],
             }
             yield {"type": "done"}
             return

@@ -50,9 +50,13 @@ async def reserve(
     connection_id: uuid.UUID,
     question: str,
     monthly_limit: int,
+    follow_up_of: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Reserve the question's QueryLog row, or raise Conflict (one already running) or
-    LimitReached("QUERY_LIMIT_REACHED"). Commits the session."""
+    LimitReached("QUERY_LIMIT_REACHED"). Commits the session.
+
+    `follow_up_of` links a follow-up to the earlier question; it's kept only if that question
+    is this user's, on the same connection."""
     # Serialises this user's reservations; other users are unaffected.
     await session.execute(select(User.id).where(User.id == user_id).with_for_update())
 
@@ -63,7 +67,15 @@ async def reserve(
         await session.rollback()
         raise LimitReached("QUERY_LIMIT_REACHED")
 
-    log = QueryLog(user_id=user_id, connection_id=connection_id, nl_query=question, status="pending")
+    if follow_up_of is not None:
+        follow_up_of = await session.scalar(
+            select(QueryLog.id).where(
+                QueryLog.id == follow_up_of, QueryLog.user_id == user_id, QueryLog.connection_id == connection_id
+            )
+        )
+    log = QueryLog(
+        user_id=user_id, connection_id=connection_id, nl_query=question, status="pending", follow_up_of=follow_up_of
+    )
     session.add(log)
     await session.commit()
     return log.id

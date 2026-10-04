@@ -24,7 +24,7 @@ from app.db.session import AsyncSessionLocal
 from app.models.models import QueryLog
 from app.services.query_executor import STATEMENT_TIMEOUT_MS, QueryResult, execute_query
 from app.services.schema_retriever import retrieve_schema
-from app.services.sql_generator import stream_sql
+from app.services.sql_generator import parse_reply, stream_sql
 from app.services.sql_validator import validate_sql
 
 logger = logging.getLogger(__name__)
@@ -69,10 +69,18 @@ async def run_pipeline(
             outcome.generated_sql += chunk
             yield {"type": "sql_chunk", "chunk": chunk}
         outcome.generated_sql = outcome.generated_sql.strip()
+        reply = parse_reply(outcome.generated_sql)
 
         step = "validate"
+        if reply.cannot_answer is not None:
+            # Still a metered query (business-logic.md §5), shown as a friendly message.
+            outcome.status = "validation_error"
+            outcome.error_message = errors.describe_cannot_answer(reply.cannot_answer)
+            yield {"type": "error", "message": outcome.error_message}
+            return
         yield {"type": "status", "message": "Validating SQL..."}
-        validation = validate_sql(outcome.generated_sql, known_tables=[d.table_name for d in table_docs])
+        # The statement validated is exactly the statement executed.
+        validation = validate_sql(reply.sql, known_tables=[d.table_name for d in table_docs])
         if not validation.is_valid:
             outcome.status, outcome.error_message = "validation_error", validation.error
             yield {"type": "error", "message": validation.error}
@@ -80,7 +88,7 @@ async def run_pipeline(
 
         step = "execute"
         yield {"type": "status", "message": "Executing query..."}
-        result = await execute_query(encrypted_url, outcome.generated_sql)
+        result = await execute_query(encrypted_url, reply.sql)
         outcome.status, outcome.result = "success", result
         yield {
             "type": "results",

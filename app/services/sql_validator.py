@@ -54,6 +54,46 @@ _FORBIDDEN_FUNCTION_PATTERN = re.compile(
 )
 
 
+# Table references: the identifier after a FROM or JOIN keyword.
+_TABLE_REFERENCE_PATTERN = re.compile(r"\bFROM\s+([\w\".]+)|\bJOIN\s+([\w\".]+)", re.IGNORECASE)
+
+# FROM is also a keyword inside some expressions, where it doesn't name a table:
+# EXTRACT(YEAR FROM d), SUBSTRING(s FROM 1 FOR 3), TRIM(BOTH ' ' FROM s),
+# OVERLAY(s PLACING x FROM 1) and `a IS [NOT] DISTINCT FROM b`.
+_FROM_ARGUMENT_FUNCTION_PATTERN = re.compile(r"\b(?:EXTRACT|SUBSTRING|TRIM|OVERLAY)\s*\(", re.IGNORECASE)
+_DISTINCT_FROM_PATTERN = re.compile(r"\bDISTINCT\s+FROM\b", re.IGNORECASE)
+_STRING_LITERAL_PATTERN = re.compile(r"'(?:[^']|'')*'")
+
+
+def _without_expression_from(sql: str) -> str:
+    """The SQL with every FROM that doesn't introduce a table blanked out (only for the table check).
+
+    String literals are emptied, `IS [NOT] DISTINCT FROM` loses its FROM, and so does a FROM
+    directly inside EXTRACT/SUBSTRING/TRIM/OVERLAY(...). A subquery nested inside such a call is
+    one level deeper, so its FROM is kept and its tables are still checked.
+    """
+    text = _STRING_LITERAL_PATTERN.sub("''", sql)
+    text = _DISTINCT_FROM_PATTERN.sub("DISTINCT", text)
+    chars = list(text)
+    for match in _FROM_ARGUMENT_FUNCTION_PATTERN.finditer(text):
+        depth = 0
+        for i in range(match.end() - 1, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif (
+                depth == 1
+                and text[i : i + 4].upper() == "FROM"
+                and not (text[i - 1].isalnum() or text[i - 1] == "_")
+                and not (text[i + 4 : i + 5].isalnum() or text[i + 4 : i + 5] == "_")
+            ):
+                chars[i : i + 4] = "    "
+    return "".join(chars)
+
+
 @dataclass
 class ValidationResult:
     is_valid: bool
@@ -142,11 +182,8 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
     if known_tables:
         known_lower = {t.lower() for t in known_tables}
         # Extract identifiers that look like table names (simple heuristic)
-        from_pattern = re.compile(
-            r"\bFROM\s+([\w\".]+)|\bJOIN\s+([\w\".]+)", re.IGNORECASE
-        )
         referenced = set()
-        for match in from_pattern.finditer(sql):
+        for match in _TABLE_REFERENCE_PATTERN.finditer(_without_expression_from(sql)):
             table = (match.group(1) or match.group(2)).strip('"').lower()
             # Strip schema prefix if present (e.g. public.users -> users)
             table = table.split(".")[-1]

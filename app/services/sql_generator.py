@@ -15,6 +15,7 @@ from app.core.ai_config import (
     SQL_THINKING_BUDGET,
 )
 from app.services.genai_client import get_genai_client
+from app.services.prompt_context import PromptContext, render_examples, render_knowledge, render_turns
 from app.services.schema_store import TableDoc
 
 SYSTEM_PROMPT = """You are an expert PostgreSQL query writer helping non-technical people get answers from their own database.
@@ -67,6 +68,7 @@ def _build_prompt(
     table_docs: list[TableDoc],
     feedback: RetryFeedback | None = None,
     clarification: str | None = None,
+    context: PromptContext | None = None,
 ) -> str:
     schema_section = "\n\n".join(doc.doc for doc in table_docs)
     # Explicitly list available tables so the model cannot claim ignorance
@@ -84,9 +86,13 @@ def _build_prompt(
         if feedback
         else ""
     )
+    context = context or PromptContext()
     return (
         f"Available tables (you may ONLY use these): {available_tables}\n\n"
         f"Database Schema:\n{schema_section}\n\n"
+        f"{render_knowledge(context.knowledge)}"
+        f"{render_examples(context.examples)}"
+        f"{render_turns(context.turns)}"
         f"Question: {nl_query}\n\n"
         f"{clarification_section}"
         f"{retry_section}"
@@ -99,6 +105,7 @@ def build_request(
     table_docs: list[TableDoc],
     feedback: RetryFeedback | None = None,
     clarification: str | None = None,
+    context: PromptContext | None = None,
 ) -> tuple[str, genai_types.GenerateContentConfig]:
     """The exact prompt and config sent to Gemini (the eval suite also keys its answer cache on it)."""
     config = genai_types.GenerateContentConfig(
@@ -107,7 +114,7 @@ def build_request(
         max_output_tokens=SQL_MAX_OUTPUT_TOKENS,
         thinking_config=genai_types.ThinkingConfig(thinking_budget=SQL_THINKING_BUDGET),
     )
-    return _build_prompt(nl_query, table_docs, feedback, clarification), config
+    return _build_prompt(nl_query, table_docs, feedback, clarification, context), config
 
 
 async def stream_sql(
@@ -115,6 +122,7 @@ async def stream_sql(
     table_docs: list[TableDoc],
     feedback: RetryFeedback | None = None,
     clarification: str | None = None,
+    context: PromptContext | None = None,
 ) -> AsyncIterator[str]:
     """
     Stream the model's reply from Gemini.
@@ -123,7 +131,7 @@ async def stream_sql(
     (reply_format.parse_reply). `feedback` turns the request into a retry that shows the
     model its failed query; `clarification` carries the user's answer to a clarifying question.
     """
-    contents, config = build_request(nl_query, table_docs, feedback, clarification)
+    contents, config = build_request(nl_query, table_docs, feedback, clarification, context)
     stream = await get_genai_client().aio.models.generate_content_stream(
         model=GENERATION_MODEL,
         contents=contents,

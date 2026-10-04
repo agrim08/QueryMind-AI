@@ -10,20 +10,26 @@ from collections.abc import AsyncIterator, Callable
 
 from app.core.ai_config import GENERATION_MODEL
 from app.services.schema_store import TableDoc
-from app.services.sql_generator import build_request
+from app.services.sql_generator import RetryFeedback, build_request
 from evals.config import GENERATION_CACHE_FILE
 
-StreamSql = Callable[[str, list[TableDoc]], AsyncIterator[str]]
+StreamSql = Callable[..., AsyncIterator[str]]
 
 
-def request_key(question: str, table_docs: list[TableDoc]) -> str:
-    contents, config = build_request(question, table_docs)
+def request_key(
+    question: str,
+    table_docs: list[TableDoc],
+    feedback: RetryFeedback | None = None,
+    clarification: str | None = None,
+) -> str:
+    contents, config = build_request(question, table_docs, feedback, clarification)
     payload = [GENERATION_MODEL, contents, config.model_dump(mode="json", exclude_none=True)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 class GenerationCache:
     def __init__(self) -> None:
+        self.live_calls = 0  # Gemini calls made through this cache (first answers and retries)
         self._answers: dict[str, str] = (
             json.loads(GENERATION_CACHE_FILE.read_text(encoding="utf-8")) if GENERATION_CACHE_FILE.exists() else {}
         )
@@ -39,14 +45,20 @@ class GenerationCache:
     def wrap(self, stream_sql: StreamSql, on_live_call: Callable[[], None]) -> StreamSql:
         """A drop-in `stream_sql` that answers from the cache and saves complete live answers."""
 
-        async def cached_stream_sql(question: str, table_docs: list[TableDoc]) -> AsyncIterator[str]:
-            key = request_key(question, table_docs)
+        async def cached_stream_sql(
+            question: str,
+            table_docs: list[TableDoc],
+            feedback: RetryFeedback | None = None,
+            clarification: str | None = None,
+        ) -> AsyncIterator[str]:
+            key = request_key(question, table_docs, feedback, clarification)
             if key in self._answers:
                 yield self._answers[key]
                 return
+            self.live_calls += 1
             on_live_call()
             chunks: list[str] = []
-            async for chunk in stream_sql(question, table_docs):
+            async for chunk in stream_sql(question, table_docs, feedback, clarification):
                 chunks.append(chunk)
                 yield chunk
             # Only a stream that finished is saved; a failed one raises before this line.

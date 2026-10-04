@@ -54,7 +54,7 @@ from evals.quota import QuotaLedger  # noqa: E402
 logger = logging.getLogger("evals.run")
 
 EVAL_CLERK_ID = "eval-runner"
-PASSING = {"exact", "extra_columns", "declined"}
+PASSING = {"exact", "extra_columns", "declined", "asked"}
 # Consecutive refused generations that mean Gemini is out of quota for now.
 MAX_REFUSALS = 2
 
@@ -65,13 +65,15 @@ class CaseResult:
     id: str
     tags: list[str]
     question: str
-    # exact | extra_columns | declined (passing)
-    # mismatch | invalid_sql | error | wrongly_declined | should_decline (failing)
+    # exact | extra_columns | declined | asked (passing; "asked" only on ambiguous cases)
+    # mismatch | invalid_sql | error | wrongly_declined | should_decline | asked_unnecessarily |
+    # answered_in_words (failing)
     verdict: str
     generated_sql: str
     error: str | None
     rows: int | None
     cached: bool  # answer reused from an earlier run; timings then exclude Gemini
+    attempts: int  # 2 when the pipeline retried after a fixable error
     first_sql_ms: int | None
     total_ms: int
 
@@ -130,10 +132,6 @@ async def gold_results(connection: DBConnection, case: Case) -> list[QueryResult
     return results
 
 
-def _declined(sql: str) -> bool:
-    return "cannot answer" in sql.lower()
-
-
 async def run_case(target: Target, case: Case, cached: bool) -> CaseResult:
     connection = target.connection
     outcome = PipelineOutcome()
@@ -148,10 +146,16 @@ async def run_case(target: Target, case: Case, cached: bool) -> CaseResult:
     total_ms = int((time.perf_counter() - started) * 1000)
 
     sql = outcome.generated_sql
+    declined = outcome.kind in ("declined", "not_allowed")
     if case.cannot_answer:
-        verdict = "declined" if _declined(sql) else "should_decline"
-    elif _declined(sql):
+        verdict = "declined" if declined else "should_decline"
+    elif declined:
         verdict = "wrongly_declined"
+    elif outcome.kind == "clarify":
+        # Asking is right only when the question really has several readings.
+        verdict = "asked" if "ambiguous" in case.tags else "asked_unnecessarily"
+    elif outcome.kind == "message":
+        verdict = "answered_in_words"  # these cases need rows
     elif outcome.status == "validation_error":
         verdict = "invalid_sql"
     elif outcome.status != "success" or outcome.result is None:
@@ -170,6 +174,7 @@ async def run_case(target: Target, case: Case, cached: bool) -> CaseResult:
         error=outcome.error_message,
         rows=outcome.result.row_count if outcome.result else None,
         cached=cached,
+        attempts=outcome.attempts,
         first_sql_ms=None if cached else first_sql_ms,
         total_ms=total_ms,
     )
@@ -191,6 +196,8 @@ def summarize(results: list[CaseResult], pending: list[str]) -> dict:
         "pending": pending,
         "accuracy": round(passed / len(results), 3) if results else None,
         "by_tag": {tag: {"passed": p, "total": t} for tag, (p, t) in sorted(by_tag.items())},
+        "retried": sum(r.attempts > 1 for r in results),
+        "passed_after_retry": sum(r.attempts > 1 and r.passed for r in results),
         "median_first_sql_ms": int(statistics.median(first_sql)) if first_sql else None,
         "median_total_ms": int(statistics.median(r.total_ms for r in live)) if live else None,
     }
@@ -203,6 +210,8 @@ def render_markdown(stamp: str, results: list[CaseResult], summaries: dict[str, 
         lines += [f"## {dataset}: {score}", ""]
         if s["pending"]:
             lines += [f"Pending (next run): {', '.join(s['pending'])}", ""]
+        if s["retried"]:
+            lines += [f"Retried after a fixable error: {s['retried']} ({s['passed_after_retry']} then passed)", ""]
         if s["median_first_sql_ms"] is not None:
             lines += [
                 f"Median first SQL token {s['median_first_sql_ms']} ms, "
@@ -317,20 +326,19 @@ async def _score(
     work = sorted(((t, c) for t in targets for c in t.cases), key=lambda tc: not tc[1].core)
     results: list[CaseResult] = []
     pending: list[tuple[str, str]] = []
-    live_calls = refusals = 0
+    refusals = 0
     logger.info("%d questions, budget %d new Gemini calls", len(work), budget)
 
     for target, case in work:
         async with AsyncSessionLocal() as session:
             docs = await retrieve_schema(session, target.connection.id, case.question)
         cached = request_key(case.question, docs) in cache
-        if not cached and (live_calls >= budget or refusals >= MAX_REFUSALS):
+        # Every Gemini call counts, retries included (cache.live_calls).
+        if not cached and (cache.live_calls >= budget or refusals >= MAX_REFUSALS):
             pending.append((target.dataset, case.id))
             continue
-        if not cached:
-            if live_calls:
-                await asyncio.sleep(interval)
-            live_calls += 1
+        if not cached and cache.live_calls:
+            await asyncio.sleep(interval)
 
         result = await run_case(target, case, cached)
         if not cached and result.error == errors.GENERATION_FAILED:
@@ -343,6 +351,8 @@ async def _score(
         refusals = 0
         results.append(result)
         source = "cached" if cached else f"{result.total_ms} ms"
+        if result.attempts > 1:
+            source += ", retried"
         logger.info("%s %s [%s] %s", case.id, "PASS" if result.passed else "FAIL", result.verdict, source)
     return results, pending
 

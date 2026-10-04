@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import yaml
 
+from app.services.sql_validator import table_references
 from evals.config import DATASETS_DIR
 
 
@@ -38,3 +39,11 @@ def load_cases(dataset: str) -> list[Case]:
         if not case.gold and not case.cannot_answer:
             raise ValueError(f"Case {case.id} needs gold SQL or cannot_answer: true")
     return cases
+
+
+def needed_tables(gold_sql: str) -> set[str]:
+    """Display names (lowercased) of the tables a gold query reads."""
+    return {
+        parts[-1] if len(parts) == 1 or parts[-2] == "public" else ".".join(parts[-2:])
+        for parts in table_references(gold_sql)
+    }

@@ -94,7 +94,6 @@ indexer reads schemas other than `public`.
 | Date | Change | chinook | pagila | Median first SQL token |
 |---|---|---|---|---|
 | 2026-10-04 | Baseline (partial: Gemini free tier allows 20 requests/day) | 8/11 (c01–c11) | not run | 2.2 s |
-
 | 2026-10-04 | Validator ignores `FROM` inside `EXTRACT(…)` and similar (re-scored from cache) | 9/11 (c01–c11) | not run | — |
 
 Baseline failures: c05 typo in a name (`ILIKE '%zepelin%'`), c08 valid `EXTRACT(YEAR FROM …)`

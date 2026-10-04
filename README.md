@@ -1,308 +1,196 @@
-<div align="center">
+# QueryMind — Backend
 
-<br />
+**Your database, in plain English.** Connect a PostgreSQL database, ask a question in English, and get
+read-only SQL plus live results, streamed as they're produced. A second feature, the **Schema
+Designer**, turns a plain-English description into an ER diagram with SQL and PDF export.
 
-<!-- Replace with actual logo once generated -->
-<img src="public/logo-horizontal.svg" alt="QueryMind" height="40" />
+This repo is the FastAPI backend. The Next.js frontend is
+[agrim08/query-mind-fe](https://github.com/agrim08/query-mind-fe).
 
-<br />
-<br />
-
-**Your database, in plain English.**
-
-Ask questions. Get SQL. See results. No syntax required.
-
-<br />
-
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-querymind.app-c8f04d?style=flat-square&labelColor=080909&color=c8f04d)](https://querymind.app)
-[![Next.js](https://img.shields.io/badge/Next.js-15-080909?style=flat-square&logo=nextdotjs&logoColor=white)](https://nextjs.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-Python%203.11-080909?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Gemini](https://img.shields.io/badge/Gemini-2.5%20Flash-080909?style=flat-square&logo=google&logoColor=white)](https://deepmind.google/technologies/gemini)
-[![Pinecone](https://img.shields.io/badge/Pinecone-Serverless-080909?style=flat-square)](https://pinecone.io)
-[![Neon](https://img.shields.io/badge/Neon-PostgreSQL-080909?style=flat-square&logo=postgresql&logoColor=white)](https://neon.tech)
-
-<br />
-
-![QueryMind Demo](public/og-image.png)
-
-</div>
+[![FastAPI](https://img.shields.io/badge/FastAPI-async-080909?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Python](https://img.shields.io/badge/Python-3.11-080909?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![Gemini](https://img.shields.io/badge/Gemini-2.5%20Flash-080909?style=flat-square&logo=google&logoColor=white)](https://ai.google.dev)
+[![pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-080909?style=flat-square&logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
+[![Neon](https://img.shields.io/badge/Neon-Postgres-080909?style=flat-square)](https://neon.tech)
 
 ---
 
-## What is QueryMind?
+## How a question is answered
 
-QueryMind is a full-stack AI application that translates natural language into validated, executable SQL — and runs it against your PostgreSQL database in real time.
-
-You connect a database. You type a question. QueryMind retrieves the relevant schema from Pinecone, generates precise SQL using Gemini 2.5 Flash via a streaming SSE pipeline, validates it for safety, executes it on your Neon DB, and returns the results — all in under two seconds.
-
-It also ships a **Schema Designer**: describe your database in plain English and get a full ER diagram on an interactive React Flow canvas, with auto-drawn foreign key relationships and PDF/SQL export.
-
-No BI tool setup. No SQL editor. No developer in the loop.
-
----
-
-## RAG Pipeline
+Every step streams a status event to the browser over Server-Sent Events, so the UI is never frozen.
 
 ```
-User question
-     │
-     ▼
-Gemini text-embedding-004
-(embed the question)
-     │
-     ▼
-Pinecone vector search
-(top-6 relevant table docs by cosine similarity)
-     │
-     ▼
-Gemini 2.5 Flash
-(schema context + question → SQL, streamed via SSE)
-     │
-     ▼
-SQL Validator
-(keyword blocklist + sqlparse + table existence check)
-     │
-     ▼
-Query Executor
-(read-only async connection → Neon DB → 500-row cap)
-     │
-     ▼
-Results → Frontend
-(streamed, rendered, exportable as CSV)
+POST /api/v1/query  (Clerk JWT)
+  │
+  ├─ checks: token, monthly plan limit, the connection belongs to this user, it has been indexed
+  │          (all before any AI call, so a refused request costs nothing)
+  │
+  ├─ retrieve the tables the model sees
+  │     small schema (fits ~48k chars)  → every table, no embedding call
+  │     larger schema                   → embed the question, top 6 tables by cosine distance
+  │                                       (pgvector), plus every table they reference by foreign key
+  │
+  ├─ generate   Gemini 2.5 Flash streams SQL token by token (thinking capped, output bounded)
+  ├─ parse      strip Markdown fences; split "-- Assumption:" lines or "-- Cannot answer: <reason>"
+  ├─ validate   one SELECT, keyword blocklist, side-effecting functions blocked, known tables only
+  ├─ execute    fresh connection, READ ONLY transaction, 10 s statement_timeout, server-side cursor
+  │             reading at most 501 rows (500 shown + 1 to detect truncation), never committed
+  └─ results → done → history row (the usage meter)
 ```
 
----
+## How a database is indexed
 
-## Tech Stack
+`POST /api/v1/connections/{id}/index` streams progress while it:
 
-| Layer | Technology |
+1. **Takes a claim** on the connection (atomic `UPDATE … RETURNING`, 15-minute expiry) so two runs
+   can't overlap; the claim is released in `finally`, even if the client disconnects.
+2. **Reads the structure from the Postgres catalogs** in 4 queries, inside a read-only transaction
+   with a 15 s timeout, whatever the schema size: tables, views, materialized views and foreign
+   tables in every schema the role can read (partitions fold into their parent; system, platform and
+   extension objects are skipped), with columns, keys, comments, enum labels and row estimates.
+3. **Adds example values only for categories**: low-variety text columns (≤ 25 distinct values),
+   from `pg_stats` or a bounded read of tables with ≤ 200 rows. Columns that look personal (emails,
+   phones, passwords, names…) never contribute values.
+4. **Writes one document per table**, embeds them 100 per call (`gemini-embedding-2`, 768 dimensions),
+   and replaces the connection's rows in `schema_elements` (`halfvec(768)`) **in one transaction**
+   with the "indexed" flag: a failed run never leaves a half-written index.
+
+Example document:
+
+```
+Table: invoice (~412 rows)
+Columns:
+- invoice_id (integer) PRIMARY KEY
+- billing_country (varchar(40)) values: 'USA', 'Canada', 'Brazil', 'France' (+20 more)
+- total (numeric(10,2)) NOT NULL
+Foreign Keys:
+- (customer_id) -> customer(customer_id)
+```
+
+## Safety model
+
+QueryMind runs AI-written SQL on people's own databases, so no single layer is trusted:
+
+| Layer | What it stops |
 |---|---|
-| **Frontend** | Next.js 15 (App Router), TypeScript, Tailwind CSS v4, shadcn/ui |
-| **Auth** | Clerk — JWT verified on every backend request |
-| **Backend** | Python 3.11, FastAPI (async), SQLAlchemy 2.0, Alembic |
-| **LLM** | Gemini 2.5 Flash (`gemini-2.5-flash`) |
-| **Embeddings** | Gemini `models/text-embedding-004` |
-| **Vector DB** | Pinecone Serverless — per-connection namespaces |
-| **App DB** | Neon PostgreSQL via asyncpg |
-| **Streaming** | Server-Sent Events (SSE) — FastAPI → Next.js |
-| **State** | Zustand (client) + TanStack Query v5 (server) |
-| **Canvas** | React Flow — Schema Designer feature |
-| **Security** | Fernet encryption for connection strings, read-only DB roles |
-| **Deployment** | Vercel (frontend) + Railway (backend) |
+| Prompt | Asks for one read-only `SELECT` over the listed tables. Helpful, never relied on |
+| Validator ([`sql_validator.py`](app/services/sql_validator.py)) | Multiple statements, writes and DDL, `SELECT … INTO`, row locks, `pg_sleep` / `pg_terminate_backend` / `dblink` and similar, tables the model wasn't given |
+| Read-only transaction | Any write that gets past the validator: Postgres itself refuses it |
+| Timeout and row cap | Runaway queries and huge results (the cap is enforced while reading, not after) |
+| Fresh connection per query, no pool | One user's connection being reused for another |
+| Outbound host guard | Private, loopback, link-local and cloud-metadata addresses (SSRF) |
 
----
+Plus: identity comes only from the verified Clerk JWT (`sub`); every query on app data filters by
+`user_id` in SQL, and another user's id returns 404; connection strings are Fernet-encrypted at rest
+and never logged or returned; driver errors are mapped to plain-English messages with credentials
+redacted.
 
-## Project Structure
+## Measuring accuracy
+
+[`evals/`](evals/) scores the real pipeline on public sample databases (Chinook, Pagila): 68
+questions with hand-written gold SQL, tagged by type (joins, rankings, dates, typos, questions that
+must be declined…). A question passes when the generated query returns the same rows as the gold
+query. The first run found a validator bug that rejected every correct `EXTRACT(YEAR FROM …)` query.
+
+It's designed for Gemini's free tier (20 generations a day): answers are cached by a hash of the
+exact request, so only prompt or retrieval changes cost quota, and a daily scheduled run resumes
+where it stopped. Scores and setup: [`evals/README.md`](evals/README.md).
+
+## Tech stack
+
+| Area | Choice |
+|---|---|
+| API | FastAPI (async), Pydantic v2 |
+| App database | Neon PostgreSQL via SQLAlchemy 2.0 async + asyncpg, Alembic migrations |
+| Vectors | pgvector in the same database (`halfvec(768)`, cosine distance), plus `pg_trgm` |
+| AI | `gemini-2.5-flash` (SQL, schema designs), `gemini-embedding-2` (embeddings), one shared async client |
+| Auth and plans | Clerk JWT (RS256 via cached JWKS); plan features from the token's `fea` claim, enforced here |
+| Streaming | Server-Sent Events |
+| Encryption | Fernet for stored connection strings |
+
+## Project structure
 
 ```
-querymind/
-├── backend/
-│   ├── app/
-│   │   ├── api/
-│   │   │   ├── deps.py                  # Clerk JWT auth, DB session
-│   │   │   └── routes/
-│   │   │       ├── query.py             # POST /api/query (SSE stream)
-│   │   │       ├── schema.py            # Schema indexing + retrieval
-│   │   │       ├── connections.py       # CRUD for DB connections
-│   │   │       ├── history.py           # Query history
-│   │   │       └── users.py             # Clerk user sync
-│   │   ├── core/
-│   │   │   ├── config.py               # Pydantic settings
-│   │   │   ├── security.py             # Fernet + JWT verification
-│   │   │   └── logging.py
-│   │   ├── services/
-│   │   │   ├── schema_indexer.py       # Introspect DB → embed → Pinecone
-│   │   │   ├── schema_retriever.py     # Vector similarity search
-│   │   │   ├── sql_generator.py        # Gemini 2.5 Flash streaming
-│   │   │   ├── sql_validator.py        # Safety + syntax validation
-│   │   │   └── query_executor.py       # Read-only async execution
-│   │   ├── models/                     # SQLAlchemy models
-│   │   ├── schemas/                    # Pydantic request/response
-│   │   └── main.py
-│   └── tests/
-│       ├── unit/
-│       └── integration/
-│
-└── frontend/
-    └── src/
-        ├── app/
-        │   ├── dashboard/              # Query, history, connections, schema
-        │   └── (auth)/                 # Clerk sign-in / sign-up
-        ├── components/
-        │   ├── query/                  # NL input, SQL display, results table
-        │   ├── schema/                 # Schema explorer + React Flow canvas
-        │   └── connections/            # Connection management
-        ├── hooks/                      # useQueryStream, useConnections, useHistory
-        └── store/                      # Zustand stores
+app/
+  main.py                 app, CORS, exception handlers, routers under /api/v1
+  api/
+    deps.py               auth, plan entitlements, ownership and quota dependencies
+    endpoints/            auth (user sync), connections, query, design — HTTP only
+  services/
+    query_pipeline.py     retrieve → generate → parse → validate → execute
+    schema_introspection.py, schema_indexer.py, schema_store.py, schema_retriever.py
+    sql_generator.py, sql_validator.py, query_executor.py, target_db.py
+    embeddings.py, genai_client.py, schema_generator.py, connections.py, users.py, usage.py
+  core/                   settings, AI constants, errors and messages, SSE helper, encryption
+  models/ schemas/        SQLAlchemy models, Pydantic request/response models
+  tests/                  pytest (unit tests; opt-in tests against a real Postgres)
+alembic/versions/         every schema change is a migration
+evals/                    accuracy eval suite (see above)
+docker/                   Postgres 17 + pgvector image for local development and evals
 ```
 
----
+## API
 
-## Key Engineering Decisions
+All routes are under `/api/v1` and require a Clerk JWT.
 
-**Why SSE over WebSockets?**
-SSE is unidirectional and HTTP-native — no handshake overhead, simpler to deploy behind a reverse proxy, and exactly right for the use case (server pushing token chunks to client). WebSockets would add complexity with no benefit here.
+| Method and path | Purpose |
+|---|---|
+| `POST /users/sync` | Create or update the signed-in user (identity from the token) |
+| `GET /connections/` · `POST /connections/` · `DELETE /connections/{id}` | List, create (after a live connection test), delete |
+| `POST /connections/test` | Test a connection URL without saving it |
+| `POST /connections/{id}/index` | Index the schema (SSE: `status`, `progress`, `done`, `error`) |
+| `POST /query/` | Ask a question (SSE: `status`, `sql_chunk`, `results`, `done`, `error`) |
+| `GET /query/history` | Past questions, paginated |
+| `POST /design/generate-schema` · `GET /design/history` · `GET /design/usage` | Schema Designer |
 
-**Why Pinecone namespaces per connection?**
-Each user's database connection gets its own Pinecone namespace (`conn_{id}`). This gives clean isolation — deleting a connection deletes its namespace. No cross-contamination between user schemas.
+Plan limits return `403` with `CONNECTION_LIMIT_REACHED`, `QUERY_LIMIT_REACHED` or `DESIGN_LIMIT_REACHED`.
 
-**Why `text-embedding-004` separately from `gemini-2.5-flash`?**
-Two different jobs: `text-embedding-004` converts schema documents and user questions into dense vectors for similarity search. `gemini-2.5-flash` handles generation. Mixing them would mean paying generation-level costs for embedding calls.
+## Running locally
 
-**Why read-only at the connection level, not just the validator?**
-Defense in depth. The validator catches keyword-based attacks. The read-only Postgres connection (via `SET default_transaction_read_only = on`) catches anything that slips through, including indirect write operations.
-
-**Why Fernet for connection string encryption?**
-Symmetric, authenticated, Python-native. The encrypted string is useless without the `FERNET_SECRET_KEY`. Even a full DB breach exposes nothing useful.
-
----
-
-## Local Setup
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 18+
-- A [Neon](https://neon.tech) PostgreSQL database
-- A [Pinecone](https://pinecone.io) account (serverless, free tier)
-- A [Google AI Studio](https://aistudio.google.com) API key (Gemini)
-- A [Clerk](https://clerk.com) account
-
----
-
-### 1. Clone Backend:-
+Needs Python 3.11+, a Postgres database with the `vector` and `pg_trgm` extensions available (Neon has
+both; locally, build `docker/pgvector.Dockerfile`), a [Google AI Studio](https://aistudio.google.com)
+key and a [Clerk](https://clerk.com) application.
 
 ```bash
-git clone https://github.com/agrim08/query-mind-be
-cd querymind
-```
-
-### 2. Backend
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-Copy and fill the env file:
-
-```bash
-cp .env.example .env
-```
-
-```env
-# .env
-DATABASE_URL=postgresql+asyncpg://user:pass@host/db
-GEMINI_API_KEY=your_key_here
-PINECONE_API_KEY=your_key_here
-PINECONE_INDEX_NAME=querymind-schema
-CLERK_SECRET_KEY=sk_live_...
-FERNET_SECRET_KEY=          # generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-ENVIRONMENT=development
-MAX_QUERY_ROWS=500
-QUERY_TIMEOUT_SECONDS=10
-```
-
-Run migrations and start:
-
-```bash
+cp .env.example .env                 # then fill it in (see below)
 alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 3. Clone Frontend
-
-```bash
-git clone https://github.com/agrim08/query-mind-fe
-cd querymind
-```
-
-```bash
-npm install
-cp .env.local.example .env.local
-```
-
-```env
-# .env.local
-NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_live_...
-CLERK_SECRET_KEY=sk_live_...
-NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
-NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
-NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=/dashboard
-NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL=/dashboard
-NEXT_PUBLIC_API_URL=http://localhost:8000
-```
-
-```bash
-npm run dev
-```
-
-App is now running at `http://localhost:3000`.
-
----
-
-### 4. Docker (optional)
-
-```bash
-docker-compose up --build
-```
-
-This spins up the FastAPI backend + a local Postgres instance for development. Pinecone and Gemini are external services — configure via `.env`.
-
----
-
-## Environment Variables Reference
-
-### Backend
-
-| Variable | Required | Description |
+| Variable | Required | Notes |
 |---|---|---|
-| `DATABASE_URL` | ✓ | Neon asyncpg connection string |
-| `GEMINI_API_KEY` | ✓ | Google AI Studio key |
-| `PINECONE_API_KEY` | ✓ | Pinecone API key |
-| `PINECONE_INDEX_NAME` | ✓ | Pinecone index (create: `querymind-schema`) |
-| `CLERK_SECRET_KEY` | ✓ | Clerk backend secret |
-| `FERNET_SECRET_KEY` | ✓ | Generate with `Fernet.generate_key()` |
-| `MAX_QUERY_ROWS` | — | Default: `500` |
-| `QUERY_TIMEOUT_SECONDS` | — | Default: `10` |
-| `ENVIRONMENT` | — | `development` or `production` |
+| `DATABASE_URL` | yes | `postgresql+asyncpg://…` — the app database (also stores vectors) |
+| `GOOGLE_API_KEY` | yes | Gemini API key |
+| `ENCRYPTION_KEY` | yes | Fernet key: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `CLERK_ISSUER` | yes | Your Clerk issuer URL |
+| `CLERK_JWKS_URL` | yes | `<issuer>/.well-known/jwks.json` |
+| `CORS_ORIGINS` | no | JSON list, default `["http://localhost:3000"]` |
+| `ENVIRONMENT` | no | `production` (default: host guard on, fails fast on missing settings) or `development` |
+| `ALLOW_PRIVATE_DB_HOSTS` | no | Allow private database hosts in production (self-hosting) |
 
-### Frontend
+In `development`, connections to `localhost` and private networks are allowed so you can test against
+a local database.
 
-| Variable | Required | Description |
-|---|---|---|
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | ✓ | Clerk publishable key |
-| `CLERK_SECRET_KEY` | ✓ | Clerk secret (server-side) |
-| `NEXT_PUBLIC_API_URL` | ✓ | Backend base URL |
-| `NEXT_PUBLIC_CLERK_SIGN_IN_URL` | ✓ | `/sign-in` |
-| `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | ✓ | `/sign-up` |
+### Tests
 
----
+```bash
+pytest -q app/tests
+```
 
-## Security Model
+Unit tests mock Gemini and the target database. Opt-in tests run against a real Postgres when
+`QM_TEST_TARGET_DATABASE_URL` (any database) or `QM_TEST_PAGILA_URL` (the eval Pagila database) is set.
 
-- **Read-only connections** — every user query runs against a read-only Postgres role. Writes are impossible at the transport level, not just the application layer.
-- **Keyword blocklist** — `DROP`, `DELETE`, `INSERT`, `UPDATE`, `TRUNCATE`, `ALTER`, `CREATE`, `GRANT`, `REVOKE`, `EXEC` are rejected before reaching the DB.
-- **Fernet encryption** — connection strings are encrypted before storage. The key never touches the database.
-- **JWT verification** — every protected route verifies the Clerk JWT via JWKS. No session cookies, no custom auth logic.
-- **Row cap** — all queries return a maximum of 500 rows regardless of what the SQL requests.
-- **Execution timeout** — `SET statement_timeout = '10s'` on every connection. Long-running queries are killed automatically.
+## Known limitations
+
+- Gemini's free tier allows 20 SQL generations a day for the whole app; a real launch needs a paid key.
+- The monthly question limit is counted after each answer, so parallel requests can slightly exceed it.
+- No rate limiting yet on connection tests and questions.
+- The validator's table check is text-based: in a comma join (`FROM a, b`) only the first table is
+  checked. It guards against invented tables; the read-only transaction is the safety boundary.
 
 ---
 
-## License
-
-MIT — see [LICENSE](LICENSE)
-
----
-
-<div align="center">
-
-Built by [Agrim](https://agrimdev.vercel.app) · [Portfolio](https://agrimdev.vercel.app) · [LinkedIn](https://linkedin.com/in/agrim-gupta08)
-
-<br />
-
-*QueryMind — Your database, in plain English.*
-
-</div>
+Built by [Agrim Gupta](https://agrimdev.vercel.app) · [LinkedIn](https://linkedin.com/in/agrim-gupta08)

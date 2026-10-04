@@ -1,0 +1,261 @@
+# Chinook: a digital music store. 11 tables, all in `public`.
+# Source: lerocha/chinook-database v1.4.5 (see evals/config.py).
+#
+# Each case: a question phrased the way a non-technical user would ask it, and the gold SQL
+# that answers it. `gold` may list several queries when the question has more than one
+# reasonable reading; matching any of them passes. Gold queries select only what the
+# question asks for, because extra columns in the generated answer are allowed.
+# `cannot_answer: true` means the right answer is "-- Cannot answer: ...".
+# `core: true` puts the case in the small set (15 across datasets, every tag) that runs first,
+# so a prompt change is measured within one day's free-tier budget.
+#
+# Tags: lookup, filter, aggregate, join, multi_join, ranking, time, fuzzy, nulls,
+#       subquery, self_join, ambiguous, cannot_answer
+
+dataset: chinook
+cases:
+  - id: c01
+    tags: [aggregate]
+    question: How many customers do we have?
+    gold: SELECT count(*) FROM customer
+
+  - id: c02
+    tags: [filter]
+    question: What are the emails of our customers in Brazil?
+    gold: SELECT email FROM customer WHERE country = 'Brazil'
+
+  - id: c03
+    core: true
+    tags: [aggregate, join]
+    question: How many tracks are there in each genre?
+    gold: |
+      SELECT g.name, count(*) FROM track t JOIN genre g USING (genre_id)
+      GROUP BY g.genre_id, g.name
+
+  - id: c04
+    tags: [join]
+    question: List the album titles by AC/DC.
+    gold: |
+      SELECT al.title FROM album al JOIN artist ar USING (artist_id) WHERE ar.name = 'AC/DC'
+
+  - id: c05
+    core: true
+    tags: [fuzzy, join]
+    question: show me the albums by led zepelin
+    gold: |
+      SELECT al.title FROM album al JOIN artist ar USING (artist_id) WHERE ar.name = 'Led Zeppelin'
+
+  - id: c06
+    tags: [fuzzy, join]
+    question: what albums does iron maiden have
+    gold: |
+      SELECT al.title FROM album al JOIN artist ar USING (artist_id) WHERE ar.name = 'Iron Maiden'
+
+  - id: c07
+    tags: [aggregate]
+    question: What is our total revenue from all invoices?
+    gold: SELECT sum(total) FROM invoice
+
+  - id: c08
+    core: true
+    tags: [time, aggregate]
+    question: What were our total sales in 2023?
+    gold: SELECT sum(total) FROM invoice WHERE extract(year FROM invoice_date) = 2023
+
+  - id: c09
+    core: true
+    tags: [ranking, join]
+    question: Who are our top 5 customers by total spending? Show their email and how much they spent.
+    gold: |
+      SELECT c.email, sum(i.total) FROM customer c JOIN invoice i USING (customer_id)
+      GROUP BY c.customer_id, c.email ORDER BY 2 DESC LIMIT 5
+
+  - id: c10
+    tags: [ranking]
+    question: Which 2 countries have the most customers?
+    gold: SELECT country FROM customer GROUP BY country ORDER BY count(*) DESC LIMIT 2
+
+  - id: c11
+    core: true
+    tags: [self_join, ambiguous]
+    question: For each employee, show their last name and the last name of the person they report to.
+    gold:
+      - |
+        SELECT e.last_name, m.last_name FROM employee e JOIN employee m ON m.employee_id = e.reports_to
+      - |
+        SELECT e.last_name, m.last_name FROM employee e LEFT JOIN employee m ON m.employee_id = e.reports_to
+
+  - id: c12
+    tags: [ranking, join]
+    question: Which playlist has the most tracks?
+    gold: |
+      SELECT p.name FROM playlist p JOIN playlist_track pt USING (playlist_id)
+      GROUP BY p.playlist_id, p.name ORDER BY count(*) DESC LIMIT 1
+
+  - id: c13
+    tags: [aggregate, join]
+    question: What's the average track length in minutes for each media type?
+    gold: |
+      SELECT m.name, avg(t.milliseconds) / 60000.0 FROM track t JOIN media_type m USING (media_type_id)
+      GROUP BY m.media_type_id, m.name
+
+  - id: c14
+    tags: [multi_join, aggregate]
+    question: How much revenue has each genre generated?
+    gold: |
+      SELECT g.name, sum(il.unit_price * il.quantity) FROM invoice_line il
+      JOIN track t USING (track_id) JOIN genre g USING (genre_id)
+      GROUP BY g.genre_id, g.name
+
+  - id: c15
+    tags: [filter]
+    question: Which tracks are longer than 10 minutes?
+    gold: SELECT name FROM track WHERE milliseconds > 600000
+
+  - id: c16
+    tags: [nulls, aggregate]
+    question: How many customers have no company listed?
+    gold: SELECT count(*) FROM customer WHERE company IS NULL
+
+  - id: c17
+    tags: [ranking, join]
+    question: Which support rep looks after the most customers?
+    gold:
+      - |
+        SELECT e.first_name, e.last_name FROM employee e JOIN customer c ON c.support_rep_id = e.employee_id
+        GROUP BY e.employee_id, e.first_name, e.last_name ORDER BY count(*) DESC LIMIT 1
+      - |
+        SELECT e.first_name || ' ' || e.last_name FROM employee e JOIN customer c ON c.support_rep_id = e.employee_id
+        GROUP BY e.employee_id, e.first_name, e.last_name ORDER BY count(*) DESC LIMIT 1
+
+  - id: c18
+    tags: [time, aggregate]
+    question: How many invoices were issued each year?
+    gold: SELECT extract(year FROM invoice_date), count(*) FROM invoice GROUP BY 1
+
+  - id: c19
+    core: true
+    tags: [subquery]
+    question: Which artists don't have any albums?
+    gold: |
+      SELECT ar.name FROM artist ar WHERE NOT EXISTS (SELECT 1 FROM album al WHERE al.artist_id = ar.artist_id)
+
+  - id: c20
+    tags: [aggregate]
+    question: How many different composers are there?
+    gold: SELECT count(DISTINCT composer) FROM track
+
+  - id: c21
+    tags: [aggregate, join]
+    question: Which artists have more than 10 albums?
+    gold: |
+      SELECT ar.name FROM artist ar JOIN album al USING (artist_id)
+      GROUP BY ar.artist_id, ar.name HAVING count(*) > 10
+
+  - id: c22
+    core: true
+    tags: [ranking, multi_join]
+    question: Which artist has earned the most revenue?
+    gold: |
+      SELECT ar.name FROM invoice_line il JOIN track t USING (track_id) JOIN album al USING (album_id)
+      JOIN artist ar USING (artist_id) GROUP BY ar.artist_id, ar.name
+      ORDER BY sum(il.unit_price * il.quantity) DESC LIMIT 1
+
+  - id: c23
+    tags: [time, aggregate]
+    question: What were the total sales for each month of 2024?
+    gold:
+      - |
+        SELECT extract(month FROM invoice_date), sum(total) FROM invoice
+        WHERE extract(year FROM invoice_date) = 2024 GROUP BY 1
+      - |
+        SELECT date_trunc('month', invoice_date), sum(total) FROM invoice
+        WHERE extract(year FROM invoice_date) = 2024 GROUP BY 1
+      - |
+        SELECT to_char(invoice_date, 'YYYY-MM'), sum(total) FROM invoice
+        WHERE extract(year FROM invoice_date) = 2024 GROUP BY 1
+
+  - id: c24
+    tags: [lookup]
+    question: What's Jane Peacock's email address?
+    gold: SELECT email FROM employee WHERE first_name = 'Jane' AND last_name = 'Peacock'
+
+  - id: c25
+    tags: [multi_join]
+    question: What are the emails of customers who have bought Rock tracks?
+    gold: |
+      SELECT DISTINCT c.email FROM customer c JOIN invoice i USING (customer_id)
+      JOIN invoice_line il USING (invoice_id) JOIN track t USING (track_id)
+      JOIN genre g USING (genre_id) WHERE g.name = 'Rock'
+
+  - id: c26
+    tags: [ranking, join]
+    question: Which 4 albums have the most tracks?
+    gold: |
+      SELECT al.title FROM album al JOIN track t USING (album_id)
+      GROUP BY al.album_id, al.title ORDER BY count(*) DESC LIMIT 4
+
+  - id: c27
+    tags: [aggregate, join]
+    question: What percentage of all tracks are Rock?
+    gold: |
+      SELECT 100.0 * count(*) FILTER (WHERE g.name = 'Rock') / count(*)
+      FROM track t JOIN genre g USING (genre_id)
+
+  - id: c28
+    core: true
+    tags: [cannot_answer]
+    question: What is the phone number of each artist?
+    cannot_answer: true
+
+  - id: c29
+    tags: [cannot_answer]
+    question: How many employees took vacation last year?
+    cannot_answer: true
+
+  - id: c30
+    tags: [ranking, join]
+    question: Which country's customers have spent the most in total?
+    gold: |
+      SELECT c.country FROM customer c JOIN invoice i USING (customer_id)
+      GROUP BY c.country ORDER BY sum(i.total) DESC LIMIT 1
+
+  - id: c31
+    tags: [join]
+    question: List the tracks on the Grunge playlist.
+    gold: |
+      SELECT t.name FROM playlist p JOIN playlist_track pt USING (playlist_id)
+      JOIN track t USING (track_id) WHERE p.name = 'Grunge'
+
+  - id: c32
+    tags: [filter, aggregate]
+    question: How many tracks cost more than 99 cents?
+    gold: SELECT count(*) FROM track WHERE unit_price > 0.99
+
+  - id: c33
+    tags: [aggregate, ambiguous]
+    question: What's the average invoice total for each country?
+    gold:
+      - SELECT billing_country, avg(total) FROM invoice GROUP BY billing_country
+      - |
+        SELECT c.country, avg(i.total) FROM invoice i JOIN customer c USING (customer_id) GROUP BY c.country
+
+  - id: c34
+    tags: [ranking, multi_join]
+    question: Which employee's customers have generated the most sales?
+    gold:
+      - |
+        SELECT e.first_name, e.last_name FROM employee e JOIN customer c ON c.support_rep_id = e.employee_id
+        JOIN invoice i USING (customer_id) GROUP BY e.employee_id, e.first_name, e.last_name
+        ORDER BY sum(i.total) DESC LIMIT 1
+      - |
+        SELECT e.first_name || ' ' || e.last_name FROM employee e JOIN customer c ON c.support_rep_id = e.employee_id
+        JOIN invoice i USING (customer_id) GROUP BY e.employee_id, e.first_name, e.last_name
+        ORDER BY sum(i.total) DESC LIMIT 1
+
+  - id: c35
+    tags: [subquery, multi_join]
+    question: Which genres have never been sold?
+    gold: |
+      SELECT g.name FROM genre g WHERE NOT EXISTS (
+        SELECT 1 FROM track t JOIN invoice_line il USING (track_id) WHERE t.genre_id = g.genre_id)

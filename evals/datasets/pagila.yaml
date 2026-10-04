@@ -1,0 +1,243 @@
+# Pagila: a DVD rental business. 22 tables (7 are monthly `payment` partitions) and 7 views.
+# Source: devrimgunduz/pagila pagila-v3.1.0 (see evals/config.py).
+# Format and tags: see chinook.yaml.
+#
+# Data notes that make some cases deliberately hard:
+# - Titles and names are UPPER CASE ("ACADEMY DINOSAUR", "PENELOPE GUINESS").
+# - The actor's surname is spelled GUINESS, so "guinness" is a typo the user makes.
+# - The category is "Sci-Fi"; users type "scifi".
+
+dataset: pagila
+cases:
+  - id: p01
+    tags: [aggregate]
+    question: How many films are in our catalog?
+    gold: SELECT count(*) FROM film
+
+  - id: p02
+    tags: [filter, aggregate]
+    question: How many films are rated PG-13?
+    gold: SELECT count(*) FROM film WHERE rating = 'PG-13'
+
+  - id: p03
+    core: true
+    tags: [fuzzy, multi_join]
+    question: Which actors were in Academy Dinosaur?
+    gold:
+      - |
+        SELECT a.first_name, a.last_name FROM actor a JOIN film_actor fa USING (actor_id)
+        JOIN film f USING (film_id) WHERE f.title = 'ACADEMY DINOSAUR'
+      - |
+        SELECT a.first_name || ' ' || a.last_name FROM actor a JOIN film_actor fa USING (actor_id)
+        JOIN film f USING (film_id) WHERE f.title = 'ACADEMY DINOSAUR'
+
+  - id: p04
+    tags: [aggregate, join]
+    question: How many films are there in each category?
+    gold: |
+      SELECT c.name, count(*) FROM film_category fc JOIN category c USING (category_id)
+      GROUP BY c.category_id, c.name
+
+  - id: p05
+    tags: [ranking, multi_join]
+    question: Which film category has the highest average rental rate?
+    gold: |
+      SELECT c.name FROM film f JOIN film_category fc USING (film_id) JOIN category c USING (category_id)
+      GROUP BY c.category_id, c.name ORDER BY avg(f.rental_rate) DESC LIMIT 1
+
+  - id: p06
+    tags: [ranking, join]
+    question: Who are our top 5 customers by total payments? Show their email and total paid.
+    gold: |
+      SELECT c.email, sum(p.amount) FROM customer c JOIN payment p USING (customer_id)
+      GROUP BY c.customer_id, c.email ORDER BY 2 DESC LIMIT 5
+
+  - id: p07
+    core: true
+    tags: [time, aggregate]
+    question: What was our total revenue for each month?
+    gold:
+      - SELECT date_trunc('month', payment_date), sum(amount) FROM payment GROUP BY 1
+      - SELECT to_char(payment_date, 'YYYY-MM'), sum(amount) FROM payment GROUP BY 1
+      - SELECT extract(month FROM payment_date), sum(amount) FROM payment GROUP BY 1
+      - |
+        SELECT extract(year FROM payment_date), extract(month FROM payment_date), sum(amount)
+        FROM payment GROUP BY 1, 2
+
+  - id: p08
+    tags: [subquery, multi_join]
+    question: Which films have never been rented?
+    gold: |
+      SELECT f.title FROM film f WHERE NOT EXISTS (
+        SELECT 1 FROM inventory i JOIN rental r USING (inventory_id) WHERE i.film_id = f.film_id)
+
+  - id: p09
+    tags: [aggregate]
+    question: How many customers does each store have?
+    gold: SELECT store_id, count(*) FROM customer GROUP BY store_id
+
+  - id: p10
+    core: true
+    tags: [ambiguous, multi_join]
+    question: What is the total revenue for each store?
+    gold:
+      - |
+        SELECT i.store_id, sum(p.amount) FROM payment p JOIN rental r USING (rental_id)
+        JOIN inventory i USING (inventory_id) GROUP BY i.store_id
+      - SELECT s.store_id, sum(p.amount) FROM payment p JOIN staff s USING (staff_id) GROUP BY s.store_id
+
+  - id: p11
+    tags: [multi_join, filter]
+    question: What are the emails of customers who live in Canada?
+    gold: |
+      SELECT c.email FROM customer c JOIN address a USING (address_id) JOIN city ci USING (city_id)
+      JOIN country co USING (country_id) WHERE co.country = 'Canada'
+
+  - id: p12
+    tags: [ranking, join]
+    question: Which 5 actors have appeared in the most films?
+    gold:
+      - |
+        SELECT a.first_name, a.last_name FROM actor a JOIN film_actor fa USING (actor_id)
+        GROUP BY a.actor_id, a.first_name, a.last_name ORDER BY count(*) DESC LIMIT 5
+      - |
+        SELECT a.first_name || ' ' || a.last_name FROM actor a JOIN film_actor fa USING (actor_id)
+        GROUP BY a.actor_id, a.first_name, a.last_name ORDER BY count(*) DESC LIMIT 5
+
+  - id: p13
+    tags: [filter]
+    question: Which films are longer than 3 hours?
+    gold: SELECT title FROM film WHERE length > 180
+
+  - id: p14
+    tags: [aggregate]
+    question: What's the average film length for each rating?
+    gold: SELECT rating, avg(length) FROM film GROUP BY rating
+
+  - id: p15
+    core: true
+    tags: [nulls, join]
+    question: Which customers still haven't returned a rental? Give me their emails.
+    gold: |
+      SELECT DISTINCT c.email FROM customer c JOIN rental r USING (customer_id) WHERE r.return_date IS NULL
+
+  - id: p16
+    core: true
+    tags: [fuzzy, multi_join]
+    question: what films has penelope guinness acted in
+    gold: |
+      SELECT f.title FROM film f JOIN film_actor fa USING (film_id) JOIN actor a USING (actor_id)
+      WHERE a.first_name = 'PENELOPE' AND a.last_name = 'GUINESS'
+
+  - id: p17
+    tags: [fuzzy, multi_join]
+    question: list the films in the scifi category
+    gold: |
+      SELECT f.title FROM film f JOIN film_category fc USING (film_id) JOIN category c USING (category_id)
+      WHERE c.name = 'Sci-Fi'
+
+  - id: p18
+    tags: [ranking, join]
+    question: What language are most of our films in?
+    gold: |
+      SELECT l.name FROM film f JOIN language l USING (language_id)
+      GROUP BY l.language_id, l.name ORDER BY count(*) DESC LIMIT 1
+
+  - id: p19
+    tags: [ambiguous, aggregate]
+    question: How many active customers do we have?
+    gold:
+      - SELECT count(*) FROM customer WHERE active = 1
+      - SELECT count(*) FROM customer WHERE activebool
+
+  - id: p20
+    tags: [ranking, join]
+    question: Which staff member processed the most payments?
+    gold:
+      - |
+        SELECT s.first_name, s.last_name FROM payment p JOIN staff s USING (staff_id)
+        GROUP BY s.staff_id, s.first_name, s.last_name ORDER BY count(*) DESC LIMIT 1
+      - |
+        SELECT s.first_name || ' ' || s.last_name FROM payment p JOIN staff s USING (staff_id)
+        GROUP BY s.staff_id, s.first_name, s.last_name ORDER BY count(*) DESC LIMIT 1
+
+  - id: p21
+    tags: [time, aggregate]
+    question: How much revenue did we make in March 2022?
+    gold: |
+      SELECT sum(amount) FROM payment WHERE payment_date >= '2022-03-01' AND payment_date < '2022-04-01'
+
+  - id: p22
+    tags: [ranking, multi_join]
+    question: What are the 2 most rented films?
+    gold: |
+      SELECT f.title FROM rental r JOIN inventory i USING (inventory_id) JOIN film f USING (film_id)
+      GROUP BY f.film_id, f.title ORDER BY count(*) DESC LIMIT 2
+
+  - id: p23
+    tags: [filter, aggregate]
+    question: How many films include Deleted Scenes as a special feature?
+    gold: SELECT count(*) FROM film WHERE 'Deleted Scenes' = ANY (special_features)
+
+  - id: p24
+    core: true
+    tags: [cannot_answer]
+    question: Which films won an Oscar?
+    cannot_answer: true
+
+  - id: p25
+    tags: [cannot_answer]
+    question: What is each staff member's salary?
+    cannot_answer: true
+
+  - id: p26
+    tags: [aggregate, join]
+    question: Which customers have spent more than $200 in total? Show their emails.
+    gold: |
+      SELECT c.email FROM customer c JOIN payment p USING (customer_id)
+      GROUP BY c.customer_id, c.email HAVING sum(p.amount) > 200
+
+  - id: p27
+    tags: [multi_join, aggregate]
+    question: What is the average payment amount from customers in India?
+    gold: |
+      SELECT avg(p.amount) FROM payment p JOIN customer c USING (customer_id) JOIN address a USING (address_id)
+      JOIN city ci USING (city_id) JOIN country co USING (country_id) WHERE co.country = 'India'
+
+  - id: p28
+    tags: [aggregate]
+    question: Which last names are shared by more than one actor?
+    gold: SELECT last_name FROM actor GROUP BY last_name HAVING count(*) > 1
+
+  - id: p29
+    tags: [fuzzy, join, aggregate]
+    question: How many copies of Academy Dinosaur does each store have?
+    gold: |
+      SELECT i.store_id, count(*) FROM inventory i JOIN film f USING (film_id)
+      WHERE f.title = 'ACADEMY DINOSAUR' GROUP BY i.store_id
+
+  - id: p30
+    core: true
+    tags: [multi_join, aggregate]
+    question: How much revenue has each film category brought in?
+    gold: |
+      SELECT c.name, sum(p.amount) FROM payment p JOIN rental r USING (rental_id)
+      JOIN inventory i USING (inventory_id) JOIN film_category fc USING (film_id)
+      JOIN category c USING (category_id) GROUP BY c.category_id, c.name
+
+  - id: p31
+    tags: [ranking, multi_join]
+    question: Which country has the most customers?
+    gold: |
+      SELECT co.country FROM customer c JOIN address a USING (address_id) JOIN city ci USING (city_id)
+      JOIN country co USING (country_id) GROUP BY co.country_id, co.country ORDER BY count(*) DESC LIMIT 1
+
+  - id: p32
+    tags: [time, aggregate]
+    question: How many rentals were made on weekends?
+    gold: SELECT count(*) FROM rental WHERE extract(isodow FROM rental_date) IN (6, 7)
+
+  - id: p33
+    tags: [lookup, join]
+    question: What's the address of store 1?
+    gold: SELECT a.address FROM store s JOIN address a USING (address_id) WHERE s.store_id = 1

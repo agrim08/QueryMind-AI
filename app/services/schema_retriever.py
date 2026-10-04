@@ -1,65 +1,51 @@
-"""Schema Retriever — embeds a NL query and fetches top-k relevant table docs from Pinecone."""
-import asyncio
-from dataclasses import dataclass
+"""Schema retriever: the tables the model sees for a question.
 
-from google import genai
-from google.genai import types as genai_types
-from pinecone import Pinecone
+- Small schemas (all table documents fit FULL_SCHEMA_CHAR_BUDGET) are sent whole. No
+  embedding call or vector search, and no table can be missed.
+- Larger schemas: the closest tables by vector search, plus the tables they reference
+  through foreign keys, so a link table always arrives with what it links to.
 
-from app.core.config import settings
+Phase 1.4 extends the large-schema path with hybrid search and re-ranking.
+"""
+import re
+import uuid
 
-EMBEDDING_MODEL = "models/gemini-embedding-002"
-TOP_K = 6
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.ai_config import FULL_SCHEMA_CHAR_BUDGET, RETRIEVAL_TOP_K_TABLES
+from app.services.embeddings import embed_query
+from app.services.schema_store import TableDoc, all_tables, schema_size, search_tables, tables_by_name
+
+# Foreign-key lines in a table document: "- (customer_id) -> customers(id)"
+_FK_TARGET = re.compile(r"^- \(.*\) -> (.+)\(.*\)$", re.MULTILINE)
 
 
-@dataclass
-class TableDoc:
-    table_name: str
-    doc: str
-    score: float
+def referenced_tables(docs: list[TableDoc]) -> set[str]:
+    """Tables referenced by foreign keys from `docs` that aren't already in `docs`."""
+    present = {d.table_name for d in docs}
+    return {name for d in docs for name in _FK_TARGET.findall(d.doc)} - present
 
 
-async def retrieve_schema(nl_query: str, namespace: str) -> list[TableDoc]:
-    """Embed the NL query and return the top-k most relevant table docs.
+def within_budget(docs: list[TableDoc], budget: int = FULL_SCHEMA_CHAR_BUDGET) -> list[TableDoc]:
+    """Keep docs in order until the character budget is spent (the first is always kept)."""
+    kept, used = [], 0
+    for doc in docs:
+        if kept and used + len(doc.doc) > budget:
+            break
+        kept.append(doc)
+        used += len(doc.doc)
+    return kept
 
-    Runs Pinecone query in a thread executor to avoid blocking the event loop.
-    """
-    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
-    # Embed the query
-    embed_result = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=nl_query,
-            config=genai_types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
-        ),
-    )
-    query_vector = embed_result.embeddings[0].values
+async def retrieve_schema(
+    session: AsyncSession,
+    connection_id: uuid.UUID,
+    nl_query: str,
+) -> list[TableDoc]:
+    """The table documents to put in the prompt for this question."""
+    if await schema_size(session, connection_id) <= FULL_SCHEMA_CHAR_BUDGET:
+        return await all_tables(session, connection_id)
 
-    # Query Pinecone
-    pc = Pinecone(api_key=settings.PINECONE_API_KEY)
-    index = pc.Index(settings.PINECONE_INDEX_NAME)
-
-    results = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: index.query(
-            vector=query_vector,
-            top_k=TOP_K,
-            namespace=namespace,
-            include_metadata=True,
-        ),
-    )
-
-    table_docs: list[TableDoc] = []
-    for match in results.get("matches", []):
-        meta = match.get("metadata", {})
-        table_docs.append(
-            TableDoc(
-                table_name=meta.get("table_name", ""),
-                doc=meta.get("doc", ""),
-                score=match.get("score", 0.0),
-            )
-        )
-
-    return table_docs
+    ranked = await search_tables(session, connection_id, await embed_query(nl_query), RETRIEVAL_TOP_K_TABLES)
+    linked = await tables_by_name(session, connection_id, referenced_tables(ranked))
+    return within_budget(ranked + linked)

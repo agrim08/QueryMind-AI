@@ -40,14 +40,14 @@ from app.core.ai_config import GENERATION_MODEL  # noqa: E402
 from app.core.security import encrypt  # noqa: E402
 from app.db.session import AsyncSessionLocal, engine  # noqa: E402
 from app.models.models import DBConnection, User  # noqa: E402
-from app.services import query_pipeline, sql_generator  # noqa: E402
+from app.services import knowledge, query_pipeline, question_context, sql_generator  # noqa: E402
 from app.services.query_executor import QueryResult, execute_query  # noqa: E402
 from app.services.query_pipeline import PipelineOutcome, run_pipeline  # noqa: E402
 from app.services.schema_indexer import index_connection  # noqa: E402
 from app.services.schema_retriever import retrieve_schema  # noqa: E402
 from evals.compare import compare_results  # noqa: E402
 from evals.config import DEFAULT_INTERVAL_S, REPORTS_DIR, SOURCES  # noqa: E402
-from evals.dataset import Case, load_cases  # noqa: E402
+from evals.dataset import Case, load_cases, load_knowledge  # noqa: E402
 from evals.generation_cache import GenerationCache, request_key  # noqa: E402
 from evals.quota import QuotaLedger  # noqa: E402
 
@@ -138,8 +138,10 @@ async def run_case(target: Target, case: Case, cached: bool) -> CaseResult:
     started = time.perf_counter()
     first_sql_ms: int | None = None
     async with AsyncSessionLocal() as session:
+        # The same context the app loads: the connection's definitions (seeded with --knowledge).
+        context = await question_context.load(session, connection.user_id, connection.id, case.question, None)
         async for event in run_pipeline(
-            session, connection.id, connection.encrypted_conn_string, case.question, outcome
+            session, connection.id, connection.encrypted_conn_string, case.question, outcome, None, context
         ):
             if event["type"] == "sql_chunk" and first_sql_ms is None:
                 first_sql_ms = int((time.perf_counter() - started) * 1000)
@@ -203,8 +205,9 @@ def summarize(results: list[CaseResult], pending: list[str]) -> dict:
     }
 
 
-def render_markdown(stamp: str, results: list[CaseResult], summaries: dict[str, dict]) -> str:
-    lines = [f"# Eval report {stamp}", "", f"Model: `{GENERATION_MODEL}`", ""]
+def render_markdown(stamp: str, results: list[CaseResult], summaries: dict[str, dict], with_knowledge: bool) -> str:
+    context = "on" if with_knowledge else "off"
+    lines = [f"# Eval report {stamp}", "", f"Model: `{GENERATION_MODEL}` · business definitions: {context}", ""]
     for dataset, s in summaries.items():
         score = f"{s['passed']}/{s['scored']} ({s['accuracy']:.0%})" if s["scored"] else "nothing scored"
         lines += [f"## {dataset}: {score}", ""]
@@ -233,17 +236,18 @@ def render_markdown(stamp: str, results: list[CaseResult], summaries: dict[str, 
     return "\n".join(lines)
 
 
-def write_report(results: list[CaseResult], summaries: dict[str, dict]) -> None:
+def write_report(results: list[CaseResult], summaries: dict[str, dict], with_knowledge: bool) -> None:
     REPORTS_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     report = {
         "model": GENERATION_MODEL,
+        "business_definitions": with_knowledge,
         "created_at": stamp,
         "summaries": summaries,
         "cases": [{**asdict(r), "passed": r.passed} for r in results],
     }
     (REPORTS_DIR / f"{stamp}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    markdown = render_markdown(stamp, results, summaries)
+    markdown = render_markdown(stamp, results, summaries, with_knowledge)
     (REPORTS_DIR / "latest.md").write_text(markdown, encoding="utf-8")
     logger.info("\n%s", markdown)
     logger.info("Report: %s", REPORTS_DIR / "latest.md")
@@ -263,7 +267,20 @@ async def check_gold(targets: list[Target]) -> None:
                 logger.error("  %s  FAILED: %s", case.id, errors.exception_summary(exc))
 
 
-async def _prepare(datasets: list[str], ids: set[str] | None, core_only: bool, reindex: bool) -> list[Target]:
+async def seed_knowledge(connection: DBConnection, dataset: str, enabled: bool) -> None:
+    """Load the dataset's definitions (evals/datasets/<name>.knowledge.yaml) into the eval
+    connection, or clear them, so runs with and without business context can be compared."""
+    drafts = load_knowledge(dataset) if enabled else []
+    async with AsyncSessionLocal() as session:
+        await knowledge.replace_ai_items(session, connection.user_id, connection.id, drafts)
+        await session.commit()
+    if enabled:
+        logger.info("Business context on for %s: %d definitions", dataset, len(drafts))
+
+
+async def _prepare(
+    datasets: list[str], ids: set[str] | None, core_only: bool, reindex: bool, with_knowledge: bool
+) -> list[Target]:
     targets = []
     for dataset in datasets:
         cases = [
@@ -273,6 +290,7 @@ async def _prepare(datasets: list[str], ids: set[str] | None, core_only: bool, r
             continue
         connection = await ensure_connection(dataset)
         await ensure_indexed(connection, reindex)
+        await seed_knowledge(connection, dataset, with_knowledge)
         targets.append(Target(dataset, connection, cases))
     return targets
 
@@ -286,10 +304,11 @@ async def run_evals(
     reindex: bool = False,
     interval: float = DEFAULT_INTERVAL_S,
     gold_only: bool = False,
+    with_knowledge: bool = False,
 ) -> None:
     """Score the pipeline on the given datasets, spending at most today's eval budget."""
     try:
-        targets = await _prepare(datasets, ids, core_only, reindex)
+        targets = await _prepare(datasets, ids, core_only, reindex, with_knowledge)
         if gold_only:
             await check_gold(targets)
             return
@@ -311,7 +330,7 @@ async def run_evals(
             )
             for t in targets
         }
-        write_report(results, summaries)
+        write_report(results, summaries, with_knowledge)
     finally:
         await engine.dispose()
 
@@ -365,6 +384,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget", type=int)
     parser.add_argument("--check-gold", action="store_true")
     parser.add_argument("--reindex", action="store_true")
+    parser.add_argument("--knowledge", action="store_true", help="seed each dataset's business definitions")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S)
     return parser.parse_args()
 
@@ -381,6 +401,7 @@ if __name__ == "__main__":
             ids=set(args.ids.split(",")) if args.ids else None,
             core_only=args.core,
             reindex=args.reindex,
+            with_knowledge=args.knowledge,
             interval=args.interval,
             gold_only=args.check_gold,
         )

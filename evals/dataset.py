@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import yaml
 
+from app.services.knowledge import ItemDraft
 from app.services.sql_validator import table_references
 from evals.config import DATASETS_DIR
 
@@ -47,3 +48,12 @@ def needed_tables(gold_sql: str) -> set[str]:
         parts[-1] if len(parts) == 1 or parts[-2] == "public" else ".".join(parts[-2:])
         for parts in table_references(gold_sql)
     }
+
+
+def load_knowledge(dataset: str) -> list[ItemDraft]:
+    """The dataset's business definitions (`<name>.knowledge.yaml`), like BIRD's evidence."""
+    path = DATASETS_DIR / f"{dataset}.knowledge.yaml"
+    if not path.exists():
+        return []
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return [ItemDraft(item["kind"], item["name"], item["definition"]) for item in raw["definitions"]]

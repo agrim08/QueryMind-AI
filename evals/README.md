@@ -43,7 +43,7 @@ The runner overrides `DATABASE_URL` to point at that database, so evals never to
 powershell -ExecutionPolicy Bypass -File backend\evals\schedule.ps1
 ```
 
-Registers the Windows task "QueryMind daily eval": 3:00 AM daily, or as soon as possible after
+Registers the Windows task "QueryMind daily eval": 1:30 AM daily, or as soon as possible after
 that if the PC was off. It starts Docker Desktop and the container if needed, spends the day's
 budget and writes `reports/latest.md` (log: `reports/daily.log`). Turn on "Start Docker Desktop
 when you sign in" in Docker Desktop's settings. Remove the task with
@@ -58,6 +58,7 @@ python -m evals.run chinook --check-gold    # gold queries only, no Gemini calls
 python -m evals.run pagila --ids p03,p16    # selected cases
 python -m evals.run --budget 3              # at most 3 new Gemini calls
 python -m evals.run pagila --reindex        # rebuild the schema index first
+python -m evals.run --knowledge             # with each dataset's business definitions
 ```
 
 Each run writes `reports/<timestamp>.json` (every generated query) and `reports/latest.md`
@@ -78,6 +79,12 @@ Embedding calls only. Results on 2026-10-04 (top 6 tables):
 Foreign-key expansion is the big win. Hybrid search ties on whole questions but misses fewer tables
 inside the failing ones. The remaining misses are 4–5-table join chains (film → inventory → rental →
 payment); two-hop FK expansion is the likely next step.
+
+## Business definitions
+
+`datasets/<name>.knowledge.yaml` holds a few short, true definitions per dataset (like BIRD's
+evidence sentences). `--knowledge` loads them into the eval connection before the run; without it
+they're cleared, so the default run stays the baseline. Reports say which mode they used.
 
 ## Scoring
 

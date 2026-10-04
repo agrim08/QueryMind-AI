@@ -55,7 +55,7 @@ class TestGenerationCache:
     def test_miss_calls_gemini_and_saves_then_hit_reuses(self, cache):
         calls: list[str] = []
 
-        async def live(question, docs, feedback=None, clarification=None):
+        async def live(question, docs, *options):
             calls.append(question)
             yield "SELECT name "
             yield "FROM artist"
@@ -67,7 +67,7 @@ class TestGenerationCache:
         assert request_key("q", DOCS) in GenerationCache()  # persisted for the next run
 
     def test_failed_stream_is_not_saved(self, cache):
-        async def refused(question, docs, feedback=None, clarification=None):
+        async def refused(question, docs, *options):
             yield "SELECT"
             raise RuntimeError("429 RESOURCE_EXHAUSTED")
 
@@ -78,7 +78,7 @@ class TestGenerationCache:
     def test_live_calls_are_reported(self, cache):
         recorded: list[int] = []
 
-        async def live(question, docs, feedback=None, clarification=None):
+        async def live(question, docs, *options):
             yield "SELECT 1"
 
         stream_sql = cache.wrap(live, on_live_call=lambda: recorded.append(1))

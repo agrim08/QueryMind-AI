@@ -3,7 +3,7 @@
 # Remove it with:
 #   Unregister-ScheduledTask -TaskName "QueryMind daily eval" -Confirm:$false
 #
-# Runs at 3:00 AM, or as soon as possible afterwards if the PC was off or asleep. It only runs
+# Runs at 1:30 AM, or as soon as possible afterwards if the PC was off or asleep. It only runs
 # while you're signed in, because Docker Desktop needs your session. pythonw.exe runs it
 # without a console window; output goes to backend\evals\reports\daily.log.
 
@@ -11,7 +11,7 @@ $backend = Split-Path $PSScriptRoot -Parent
 $python = Join-Path $backend ".venv\Scripts\pythonw.exe"
 
 $action = New-ScheduledTaskAction -Execute $python -Argument "-m evals.daily" -WorkingDirectory $backend
-$trigger = New-ScheduledTaskTrigger -Daily -At 3am
+$trigger = New-ScheduledTaskTrigger -Daily -At 1:30am
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
@@ -26,4 +26,4 @@ Register-ScheduledTask `
     -Settings $settings `
     -Force | Out-Null
 
-Write-Output "Registered 'QueryMind daily eval' (daily at 3:00 AM; runs later if the PC was off)."
+Write-Output "Registered 'QueryMind daily eval' (daily at 1:30 AM; runs later if the PC was off)."

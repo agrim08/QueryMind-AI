@@ -64,12 +64,29 @@ Each run writes `reports/<timestamp>.json` (every generated query) and `reports/
 (the readable summary). Both are git-ignored. Calls are spaced 7 seconds apart for the
 per-minute limit, and a run stops calling Gemini after two refusals in a row.
 
+## Retrieval eval
+
+`python -m evals.retrieval` forces the large-schema search path (the eval databases are small enough
+to be sent whole in the app) and checks whether every table the gold SQL reads is shown to the model.
+Embedding calls only. Results on 2026-10-04 (top 6 tables):
+
+| Dataset | Vector only | Vector + FK links | Hybrid + FK links |
+|---|---|---|---|
+| chinook | 31/33 (94%) | 31/33 (94%) | 31/33 (94%) |
+| pagila | 21/31 (68%) | 27/31 (87%) | 27/31 (87%) |
+
+Foreign-key expansion is the big win. Hybrid search ties on whole questions but misses fewer tables
+inside the failing ones. The remaining misses are 4–5-table join chains (film → inventory → rental →
+payment); two-hop FK expansion is the likely next step.
+
 ## Scoring
 
 - **Pass:** `exact` (same rows), `extra_columns` (every gold column present, rows match),
-  or `declined` on a question the database can't answer.
+  `declined` on a question the database can't answer, or `asked` (a clarifying question) on a
+  case tagged `ambiguous`.
 - **Fail:** `mismatch`, `invalid_sql` (rejected by the validator), `error` (generation or
-  execution failed), `wrongly_declined`, `should_decline`.
+  execution failed), `wrongly_declined`, `should_decline`, `asked_unnecessarily` (a clarifying
+  question on a clear question), `answered_in_words` (a text answer where rows were needed).
 - Row order is ignored. Numbers are compared to 2 decimals. A case may list several gold
   queries when the question genuinely has more than one reading; matching any one passes.
 

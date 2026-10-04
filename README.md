@@ -22,21 +22,52 @@ Every step streams a status event to the browser over Server-Sent Events, so the
 ```
 POST /api/v1/query  (Clerk JWT)
   │
-  ├─ checks: token, monthly plan limit, the connection belongs to this user, it has been indexed
-  │          (all before any AI call, so a refused request costs nothing)
+  ├─ checks: token, per-user rate limit, the connection belongs to this user, it has been indexed
+  ├─ reserve  under a lock on the user's row: monthly plan limit, one question at a time, then a
+  │           "pending" history row (the usage meter), all before any AI call
   │
   ├─ retrieve the tables the model sees
   │     small schema (fits ~48k chars)  → every table, no embedding call
-  │     larger schema                   → embed the question, top 6 tables by cosine distance
-  │                                       (pgvector), plus every table they reference by foreign key
+  │     larger schema                   → hybrid search in one SQL query: vector distance (pgvector),
+  │                                       full text and table-name trigram similarity, fused with
+  │                                       Reciprocal Rank Fusion; plus tables they reference by FK
   │
-  ├─ generate   Gemini 2.5 Flash streams SQL token by token (thinking capped, output bounded)
-  ├─ parse      strip Markdown fences; split "-- Assumption:" lines or "-- Cannot answer: <reason>"
+  ├─ generate   one Gemini 2.5 Flash call; only the SQL statement streams to the browser, the
+  │             reply's header (intent, "what I understood", assumptions) is held back
+  ├─ parse      the reply is SQL, a clarifying question with options, a plain answer about the
+  │             database, a write refusal, or "can't answer" (services/reply_format.py)
   ├─ validate   one SELECT, keyword blocklist, side-effecting functions blocked, known tables only
   ├─ execute    fresh connection, READ ONLY transaction, 10 s statement_timeout, server-side cursor
   │             reading at most 501 rows (500 shown + 1 to detect truncation), never committed
-  └─ results → done → history row (the usage meter)
+  ├─ retry    once, only for fixable mistakes: the database's error (unknown column, bad cast…)
+  │           or a table the model wasn't shown (its description is added) goes back to Gemini
+  ├─ present  chart + headline by rules, no AI (services/answer_presentation.py)
+  └─ results → done → the history row is completed
 ```
+
+"What tables do I have?" skips all of this: it's answered from the index with no AI call.
+
+## How answers are presented
+
+The model labels each question (one number, trend, ranking, breakdown, comparison, list, single
+record…) in the same call that writes the SQL. The backend then picks the presentation from the
+result's actual column types, without another AI call:
+
+| Result | Shown as | Headline (template, filled from the data) |
+|---|---|---|
+| one number | big figure | "Total sales in 2023: 469.58" |
+| a label and a number in one row | labelled figure | "Artist with the most revenue: Iron Maiden (138.60)" |
+| one detailed row | record card | "Details of customer 42." |
+| time + numbers | line chart (one category can become ≤ 4 lines) | "Revenue went from 37.62 (Jan 2024) to 50.49 (Apr 2024), up 34%. Highest: 52.62 in Mar 2024." |
+| category + number, ≤ 25 rows | bar chart | "USA is highest with 13 (3 shown)." / "… 75% of the total" |
+| category + several numbers | one bar panel per measure, led by the one the rows are ranked by | "AI-Madness leads on questions asked: 15 (linked users: 1). 3 shown." |
+| lists and everything else | table | "42 rows." |
+
+Every answer also shows what was understood, the assumptions made, one-click "Instead:" questions
+for the other reading, and 2–3 follow-up questions. When a question has readings that would give
+materially different answers ("best customers": by spend or by orders?), the model asks one
+multiple-choice question instead of guessing; the answer continues the same question, so it
+counts once.
 
 ## How a database is indexed
 
@@ -92,7 +123,11 @@ questions with hand-written gold SQL, tagged by type (joins, rankings, dates, ty
 must be declined…). A question passes when the generated query returns the same rows as the gold
 query. The first run found a validator bug that rejected every correct `EXTRACT(YEAR FROM …)` query.
 
-It's designed for Gemini's free tier (20 generations a day): answers are cached by a hash of the
+A second script, `python -m evals.retrieval`, checks the large-schema search on its own: for each
+question, are all the tables the gold SQL needs among the tables the model would be shown? It
+compares vector-only, vector + foreign-key links, and hybrid search, using embedding calls only.
+
+The suite is designed for Gemini's free tier (20 generations a day): answers are cached by a hash of the
 exact request, so only prompt or retrieval changes cost quota, and a daily scheduled run resumes
 where it stopped. Scores and setup: [`evals/README.md`](evals/README.md).
 
@@ -139,11 +174,13 @@ All routes are under `/api/v1` and require a Clerk JWT.
 | `GET /connections/` · `POST /connections/` · `DELETE /connections/{id}` | List, create (after a live connection test), delete |
 | `POST /connections/test` | Test a connection URL without saving it |
 | `POST /connections/{id}/index` | Index the schema (SSE: `status`, `progress`, `done`, `error`) |
-| `POST /query/` | Ask a question (SSE: `status`, `sql_chunk`, `results`, `done`, `error`) |
+| `POST /query/` | Ask a question (SSE: `status`, `sql_chunk`, `retry`, `results`, `clarify`, `message`, `done`, `error`); send `clarification: {question_id, answer}` to answer a `clarify` |
 | `GET /query/history` | Past questions, paginated |
 | `POST /design/generate-schema` · `GET /design/history` · `GET /design/usage` | Schema Designer |
 
 Plan limits return `403` with `CONNECTION_LIMIT_REACHED`, `QUERY_LIMIT_REACHED` or `DESIGN_LIMIT_REACHED`.
+A second question while one is running returns `409`; bursts (per user, per minute: 10 questions,
+10 connection tests, 5 index runs, 5 designs) return `429`.
 
 ## Running locally
 
@@ -186,8 +223,7 @@ Unit tests mock Gemini and the target database. Opt-in tests run against a real 
 ## Known limitations
 
 - Gemini's free tier allows 20 SQL generations a day for the whole app; a real launch needs a paid key.
-- The monthly question limit is counted after each answer, so parallel requests can slightly exceed it.
-- No rate limiting yet on connection tests and questions.
+- Rate limits are kept in memory per process; running several workers needs a shared store (Redis).
 - The validator's table check is text-based: in a comma join (`FROM a, b`) only the first table is
   checked. It guards against invented tables; the read-only transaction is the safety boundary.
 

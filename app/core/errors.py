@@ -57,6 +57,7 @@ DESIGN_FAILED = (
     "We couldn't generate a schema right now. Please try again in a moment."
 )
 INTERNAL_ERROR = "Something went wrong on our side. Please try again in a moment."
+CANNOT_ANSWER = "That isn't in your data. {reason}Try rephrasing, or ask about something your tables record."
 SCHEMA_NOT_INDEXED = (
     "Still mapping your database. We are reading your tables so you can ask questions. "
     "Index this connection and try again in a moment."
@@ -109,6 +110,17 @@ def _postgres_message(error: pg_errors.PostgresError) -> str:
     """The server's primary message only (no SQL text, no connection details)."""
     message = getattr(error, "message", None) or str(error)
     return redact(message.strip().rstrip("."))
+
+
+def describe_cannot_answer(reason: str) -> str:
+    """Message when the model declines because the schema can't answer the question.
+
+    `reason` is the model's one-sentence explanation; it describes the user's own schema.
+    """
+    reason = " ".join(reason.split())
+    if reason and reason[-1] not in ".!?":
+        reason += "."
+    return CANNOT_ANSWER.format(reason=f"{reason[0].upper()}{reason[1:]} " if reason else "")
 
 
 def describe_connection_error(exc: BaseException) -> str:

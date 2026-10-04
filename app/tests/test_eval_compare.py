@@ -3,6 +3,7 @@ from datetime import date
 from decimal import Decimal
 
 from evals.compare import compare_results, normalize
+from evals.dataset import needed_tables
 
 
 class TestNormalize:
@@ -57,3 +58,15 @@ class TestCompareResults:
 
     def test_empty_results_agree(self):
         assert compare_results([], []) == "exact"
+
+
+class TestNeededTables:
+    def test_gold_tables_ignore_expression_from_and_aliases(self):
+        sql = (
+            "SELECT al.title FROM album al JOIN artist ar USING (artist_id) "
+            "WHERE EXTRACT(year FROM al.created) = 2023 AND al.id IN (SELECT album_id FROM track)"
+        )
+        assert needed_tables(sql) == {"album", "artist", "track"}
+
+    def test_schema_qualified(self):
+        assert needed_tables('SELECT * FROM "public"."invoice" JOIN sales.orders USING (id)') == {"invoice", "sales.orders"}

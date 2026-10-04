@@ -57,6 +57,20 @@ DESIGN_FAILED = (
     "We couldn't generate a schema right now. Please try again in a moment."
 )
 INTERNAL_ERROR = "Something went wrong on our side. Please try again in a moment."
+SCHEMA_NOT_INDEXED = (
+    "Still mapping your database. We are reading your tables so you can ask questions. "
+    "Index this connection and try again in a moment."
+)
+INDEXING_IN_PROGRESS = "This connection is already being indexed. Please wait for it to finish."
+CONNECTION_NOT_FOUND = "Connection not found."
+HOST_NOT_ALLOWED = (
+    "That database host isn't reachable from QueryMind. Use a database that accepts "
+    "connections from the internet (private and local network addresses aren't allowed)."
+)
+UNSUPPORTED_SCHEME = (
+    "Only PostgreSQL connection strings are supported "
+    "(postgresql://, postgres://, or postgresql+asyncpg://)."
+)
 
 # scheme://user:password@  →  scheme://***@
 _DSN_CREDENTIALS = re.compile(r"([a-zA-Z][\w+.-]*://)[^@\s/'\"]+@")

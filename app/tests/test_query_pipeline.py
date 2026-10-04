@@ -33,6 +33,7 @@ class Harness:
         self.executed: list[str] = []
         self.prompts: list[tuple[list[str], object]] = []  # (tables shown, feedback) per call
         self.clarifications: list[str | None] = []
+        self.contexts: list[object] = []
 
         async def retrieve_schema(session, connection_id, question):
             return [INVOICE]
@@ -43,7 +44,8 @@ class Harness:
         async def all_tables(session, connection_id):
             return [CUSTOMER, INVOICE]
 
-        async def stream_sql(question, docs, feedback=None, clarification=None):
+        async def stream_sql(question, docs, feedback=None, clarification=None, context=None):
+            self.contexts.append(context)
             self.prompts.append(([d.table_name for d in docs], feedback))
             self.clarifications.append(clarification)
             yield self.replies.pop(0)
@@ -152,7 +154,7 @@ def test_gemini_quota_errors_say_busy(monkeypatch):
 
     h = Harness(monkeypatch, [])
 
-    async def refused(question, docs, feedback=None, clarification=None):
+    async def refused(question, docs, feedback=None, clarification=None, context=None):
         raise genai_errors.ClientError(429, {"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}})
         yield  # pragma: no cover
 
@@ -231,3 +233,30 @@ class TestAnswerKinds:
         assert h.prompts == [] and outcome.status == "success"
         message = next(e for e in events if e["type"] == "message")
         assert "2 tables and views: customer, invoice" in message["text"]
+
+
+class TestBusinessContext:
+    def test_relevant_knowledge_examples_and_turns_reach_the_model(self, monkeypatch):
+        from app.services.prompt_context import Example, KnowledgeEntry, Turn
+        from app.services.question_context import QuestionContext
+
+        revenue = KnowledgeEntry("metric", "revenue", "SUM(invoice.total)")
+        unrelated_note = KnowledgeEntry("table_note", "playlist", "user playlists")
+        close = Example("total revenue", 'SELECT SUM("total") FROM "invoice"', 0.9)
+        turn = Turn("revenue by month", 'SELECT 1 FROM "invoice"')
+        h = Harness(monkeypatch, ['SELECT SUM("total") FROM "invoice"'])
+        outcome = PipelineOutcome()
+        context = QuestionContext(knowledge=(revenue, unrelated_note), examples=(close,), turns=(turn,))
+
+        async def collect() -> list[dict]:
+            return [
+                e async for e in run_pipeline(None, uuid.uuid4(), "encrypted", "total revenue?", outcome, None, context)
+            ]
+
+        events = asyncio.run(collect())
+        sent = h.contexts[0]
+        assert sent.knowledge == (revenue,)  # the note's table isn't in the prompt
+        assert sent.examples == (close,) and sent.turns == (turn,)
+        results = next(e for e in events if e["type"] == "results")
+        assert results["verified_match"] == "total revenue"
+        assert results["knowledge_used"] == ["revenue"]

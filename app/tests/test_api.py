@@ -12,6 +12,7 @@ from app.core.exceptions import Conflict, LimitReached, NotFound
 from app.db.session import get_db
 from app.main import app
 from app.services import users as user_service
+from app.services.question_context import QuestionContext
 
 USER = SimpleNamespace(id=uuid.uuid4(), clerk_id="user_real")
 
@@ -68,9 +69,10 @@ def question_steps(monkeypatch):
     async def has_elements(session, connection_id):
         return calls["indexed"]
 
-    async def reserve(session, user_id, connection_id, question, monthly_limit):
+    async def reserve(session, user_id, connection_id, question, monthly_limit, follow_up_of=None):
         calls["reserved"] = True
         calls["monthly_limit"] = monthly_limit
+        calls["follow_up_of"] = follow_up_of
         if calls["reserve_error"]:
             raise calls["reserve_error"]
         return uuid.uuid4()
@@ -79,15 +81,24 @@ def question_steps(monkeypatch):
         calls["resumed"] = log_id
         if calls.get("resume_error"):
             raise calls["resume_error"]
-        return SimpleNamespace(id=log_id, nl_query="who are our best customers?")
+        return SimpleNamespace(id=log_id, nl_query="who are our best customers?", follow_up_of=None)
 
-    async def run_pipeline(session, connection_id, url, question, outcome, clarification=None):
+    async def remember_clarification(session, user_id, log, answer):
+        calls["remembered"] = answer
+
+    async def load_context(session, user_id, connection_id, question, follow_up_of):
+        return QuestionContext()
+
+    async def run_pipeline(session, connection_id, url, question, outcome, clarification=None, context=None):
         calls["pipeline"] = (question, clarification)
+        yield {"type": "results", "rows": []}
         yield {"type": "done"}
 
     monkeypatch.setattr(query_endpoint.connection_service, "get_for_user", get_for_user)
     monkeypatch.setattr(query_endpoint, "has_elements", has_elements)
     monkeypatch.setattr(query_endpoint.query_meter, "resume", resume)
+    monkeypatch.setattr(query_endpoint.knowledge, "remember_clarification", remember_clarification)
+    monkeypatch.setattr(query_endpoint.question_context, "load", load_context)
     monkeypatch.setattr(query_endpoint, "run_pipeline", run_pipeline)
     monkeypatch.setattr(query_endpoint, "spawn", lambda coro, name: coro.close())
     monkeypatch.setattr(query_endpoint.query_meter, "reserve", reserve)
@@ -127,8 +138,17 @@ class TestQuestionGate:
         assert response.status_code == 200
         assert question_steps["reserved"] is False
         assert str(question_steps["resumed"]) == question_id
-        # The stored question is used, with the user's answer alongside.
+        # The stored question is used, with the user's answer alongside, and it's remembered.
         assert question_steps["pipeline"] == ("who are our best customers?", "By total spent")
+        assert question_steps["remembered"] == "By total spent"
+        # The answer carries the question's id, so the browser can follow up or verify it.
+        assert f'"question_id": "{question_id}"' in response.text
+
+    def test_follow_up_link_is_passed_to_the_meter(self, client, question_steps):
+        earlier = str(uuid.uuid4())
+        response = client.post("/api/v1/query/", json={**QUESTION, "follow_up_of": earlier})
+        assert response.status_code == 200
+        assert str(question_steps["follow_up_of"]) == earlier
 
     def test_expired_clarification_is_404(self, client, question_steps):
         question_steps["resume_error"] = NotFound(errors.CLARIFICATION_EXPIRED)

@@ -14,9 +14,6 @@ pydantic-settings>=2.0.0
 # Google AI (new SDK — replaces deprecated google-generativeai)
 google-genai>=1.0.0
 
-# Pinecone
-pinecone>=4.0.0
-
 # Security / Encryption
 cryptography>=42.0.0
 python-jose[cryptography]>=3.3.0

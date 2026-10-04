@@ -180,16 +180,21 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
 
     # --- 3. Optional: verify referenced tables exist in schema ---
     if known_tables:
+        # Known tables are display names: bare in `public` ("invoice"), schema.table elsewhere.
         known_lower = {t.lower() for t in known_tables}
-        # Extract identifiers that look like table names (simple heuristic)
-        referenced = set()
+        known_bare = {t.split(".")[-1] for t in known_lower}
+        unknown = set()
         for match in _TABLE_REFERENCE_PATTERN.finditer(_without_expression_from(sql)):
-            table = (match.group(1) or match.group(2)).strip('"').lower()
-            # Strip schema prefix if present (e.g. public.users -> users)
-            table = table.split(".")[-1]
-            referenced.add(table)
+            parts = [part.strip('"').lower() for part in (match.group(1) or match.group(2)).split(".")]
+            if len(parts) == 1:
+                # A bare name may refer to a listed table in any schema.
+                listed = parts[0] in known_bare
+            else:
+                schema, table = parts[-2], parts[-1]
+                listed = f"{schema}.{table}" in known_lower or (schema == "public" and table in known_lower)
+            if not listed:
+                unknown.add(".".join(parts))
 
-        unknown = referenced - known_lower
         if unknown:
             return ValidationResult(
                 is_valid=False,

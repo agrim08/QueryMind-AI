@@ -184,3 +184,35 @@ class TestKnownTablesFromKeyword:
         result = validate_sql(sql, known_tables=self.KNOWN)
         assert not result.is_valid
         assert "secret_table" in result.error
+
+
+class TestKnownTablesSchemaQualified:
+    """Tables outside `public` are listed as schema.table (Phase 1.3); `public` ones bare."""
+
+    KNOWN = ["invoice", "sales.orders"]
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT * FROM "public"."invoice"',
+            "SELECT * FROM public.invoice",
+            'SELECT * FROM "sales"."orders" o JOIN "invoice" i ON i.id = o.invoice_id',
+            "SELECT * FROM sales.orders",
+            'SELECT * FROM "Sales"."Orders"',
+        ],
+    )
+    def test_listed_tables_are_accepted(self, sql):
+        result = validate_sql(sql, known_tables=self.KNOWN)
+        assert result.is_valid, result.error
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT * FROM "hr"."orders"',  # right table name, wrong schema
+            "SELECT * FROM public.orders",  # orders isn't in public
+            'SELECT * FROM "sales"."invoice"',  # invoice isn't in sales
+            "SELECT * FROM salaries",
+        ],
+    )
+    def test_unlisted_tables_are_rejected(self, sql):
+        assert not validate_sql(sql, known_tables=self.KNOWN).is_valid

@@ -29,7 +29,7 @@ Rules you MUST follow:
 5. If the question cannot be answered using ONLY the available tables and their columns, return: -- Cannot answer: <the reason in one plain-English sentence>
 6. Always qualify column names when joining tables to avoid ambiguity.
 7. LIMIT: If the question asks for a number of results ("top 5", "the 3 most"), use exactly that LIMIT. If it asks for the single top or bottom item ("which X has the most"), use LIMIT 1. Otherwise add LIMIT 500 only when listing individual rows, never to aggregated results.
-8. CRITICAL: Always wrap ALL table names and ALL column names in double quotes (e.g., "users", "screenConfig", "projectId").
+8. CRITICAL: Always wrap ALL table names and ALL column names in double quotes (e.g., "users", "screenConfig", "projectId"). Tables listed as schema.table are written "schema"."table".
 9. JOIN LOGIC: Use explicit JOINs based on the foreign keys described in the schema. If a requested column isn't on the main table, join the table that has it.
 10. ALIASING: If you assign an alias to a table (e.g., "table" AS "t"), you MUST use that alias for all column references (e.g., "t"."column"). Never use the original table name if an alias exists.
 11. FUZZY NAMES: When the question names a specific record by text (a project, customer, product…), the user may misremember it. Match case-insensitively on the distinctive words with ILIKE and % wildcards (e.g. "p"."name" ILIKE '%aggregator%'), not with exact equality.

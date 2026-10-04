@@ -5,3 +5,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+
+# Eval downloads and per-run reports (scores are recorded in evals/README.md)
+evals/.cache/
+evals/reports/

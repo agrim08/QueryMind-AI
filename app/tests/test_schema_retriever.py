@@ -41,7 +41,7 @@ def _patch_store(monkeypatch, size: int, calls: list[str]):
         calls.append("embed_query")
         return [0.0] * 4
 
-    async def search_tables(session, connection_id, vector, limit):
+    async def search_tables_hybrid(session, connection_id, question, vector, limit):
         calls.append("search_tables")
         return [PROJECT, LINK]
 
@@ -50,7 +50,7 @@ def _patch_store(monkeypatch, size: int, calls: list[str]):
         return [USER] if "user" in names else []
 
     for name, fn in [("schema_size", schema_size), ("all_tables", all_tables), ("embed_query", embed_query),
-                     ("search_tables", search_tables), ("tables_by_name", tables_by_name)]:
+                     ("search_tables_hybrid", search_tables_hybrid), ("tables_by_name", tables_by_name)]:
         monkeypatch.setattr(schema_retriever, name, fn)
 
 

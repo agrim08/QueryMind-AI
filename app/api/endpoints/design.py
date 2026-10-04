@@ -4,7 +4,7 @@ import logging
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 
-from app.api.deps import UNLIMITED, CurrentUser, Plan, require_design_quota
+from app.api.deps import UNLIMITED, CurrentUser, Plan, rate_limited, require_design_quota
 from app.core import errors
 from app.core.exceptions import UpstreamFailure
 from app.db.session import DbSession
@@ -18,12 +18,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/generate-schema", response_model=DBSchemaDesign, dependencies=[Depends(require_design_quota)])
+DESIGNS_PER_MINUTE = 5
+
+
+@router.post(
+    "/generate-schema",
+    response_model=DBSchemaDesign,
+    dependencies=[Depends(rate_limited("design", DESIGNS_PER_MINUTE)), Depends(require_design_quota)],
+)
 async def generate_schema(request: GenerateSchemaRequest, user: CurrentUser, db: DbSession) -> DBSchemaDesign:
     """Generate a schema design and save it to the user's history (counts toward the plan)."""
     try:
         schema = await generate_schema_from_prompt(request.prompt)
-    except Exception:
+    except Exception as exc:
+        if errors.is_ai_rate_limited(exc):
+            logger.warning("Gemini rate limit during schema generation for user %s", user.id)
+            raise UpstreamFailure(errors.AI_BUSY) from None
         logger.exception("Schema generation failed for user %s", user.id)
         raise UpstreamFailure(errors.DESIGN_FAILED) from None
 

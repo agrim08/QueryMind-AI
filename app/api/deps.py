@@ -4,9 +4,12 @@ Use the Annotated aliases in endpoint signatures:
 
     async def endpoint(user: CurrentUser, plan: Plan, db: DbSession): ...
 
-and plan limits as route dependencies:
+and plan limits and rate limits as route dependencies:
 
-    @router.post("/", dependencies=[Depends(require_query_quota)])
+    @router.post("/", dependencies=[Depends(require_design_quota), Depends(rate_limited("design", 5))])
+
+The monthly question limit is enforced by services.query_meter.reserve instead, because it
+must be checked and recorded atomically.
 
 FastAPI resolves each dependency once per request, so the JWT is verified once even
 when several dependencies need its claims.
@@ -22,7 +25,9 @@ from jose import JWTError, jwt
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.exceptions import LimitReached
+from app.core import errors
+from app.core.exceptions import LimitReached, RateLimited
+from app.core.rate_limit import RateLimiter
 from app.db.session import DbSession
 from app.models.models import DBConnection, User
 from app.services import connections as connection_service
@@ -166,11 +171,6 @@ OwnedConnection = Annotated[DBConnection, Depends(get_owned_connection)]
 
 # ── Plan limits (use as route dependencies) ───────────────────────────────────
 
-async def require_query_quota(user: CurrentUser, plan: Plan, db: DbSession) -> None:
-    if plan.max_queries_pm < UNLIMITED and await usage.count_questions_this_month(db, user.id) >= plan.max_queries_pm:
-        raise LimitReached("QUERY_LIMIT_REACHED")
-
-
 async def require_design_quota(user: CurrentUser, plan: Plan, db: DbSession) -> None:
     if plan.max_designs_pm < UNLIMITED and await usage.count_designs_this_month(db, user.id) >= plan.max_designs_pm:
         raise LimitReached("DESIGN_LIMIT_REACHED")
@@ -179,3 +179,19 @@ async def require_design_quota(user: CurrentUser, plan: Plan, db: DbSession) -> 
 async def require_connection_slot(user: CurrentUser, plan: Plan, db: DbSession) -> None:
     if await usage.count_connections(db, user.id) >= plan.max_connections:
         raise LimitReached("CONNECTION_LIMIT_REACHED")
+
+
+# ── Rate limits (use as route dependencies) ───────────────────────────────────
+
+_rate_limiters: dict[str, RateLimiter] = {}
+
+
+def rate_limited(action: str, per_minute: int):
+    """Dependency allowing each user at most `per_minute` calls of `action` per minute."""
+    limiter = _rate_limiters.setdefault(action, RateLimiter(per_minute, 60))
+
+    async def check(user: CurrentUser) -> None:
+        if not limiter.allow(str(user.id)):
+            raise RateLimited(errors.TOO_MANY_REQUESTS)
+
+    return check

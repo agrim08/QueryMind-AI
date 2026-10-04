@@ -159,6 +159,9 @@ async def index_connection(
         if reading_target:
             logger.warning("Schema inspection failed: %s", errors.exception_summary(exc))
             message = errors.describe_connection_error(exc)
+        elif errors.is_ai_rate_limited(exc):
+            logger.warning("Gemini rate limit while indexing connection %s", connection_id)
+            message = errors.AI_BUSY
         else:
             logger.exception("Schema indexing failed for connection %s", connection_id)
             message = errors.INDEXING_FAILED

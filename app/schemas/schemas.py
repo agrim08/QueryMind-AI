@@ -66,9 +66,18 @@ class DBConnectionResponse(BaseModel):
 
 # ── Query ─────────────────────────────────────────────────────────────────────
 
+class ClarificationAnswer(BaseModel):
+    """The user's answer to a clarifying question (the `clarify` SSE event)."""
+
+    question_id: uuid.UUID  # from the clarify event; the question's QueryLog id
+    answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+
+
 class QueryRequest(BaseModel):
     connection_id: uuid.UUID
     nl_query: Question
+    # Set when answering a clarifying question; the question then continues (one count).
+    clarification: ClarificationAnswer | None = None
 
 
 # ── Query Log ─────────────────────────────────────────────────────────────────

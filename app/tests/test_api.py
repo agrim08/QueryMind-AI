@@ -6,6 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api import deps
+from app.api.endpoints import query as query_endpoint
+from app.core import errors
+from app.core.exceptions import Conflict, LimitReached, NotFound
 from app.db.session import get_db
 from app.main import app
 from app.services import users as user_service
@@ -22,6 +25,8 @@ def client():
     app.dependency_overrides[get_db] = lambda: _NoDb()
     app.dependency_overrides[deps.get_token_claims] = lambda: {"sub": "user_real", "fea": []}
     app.dependency_overrides[deps.get_current_user] = lambda: USER
+    for limiter in deps._rate_limiters.values():
+        limiter.reset()
     yield TestClient(app)
     app.dependency_overrides.clear()
 
@@ -47,17 +52,102 @@ class TestUserSync:
         assert response.json()["clerk_id"] == "user_real"
 
 
-class TestPlanLimits:
-    def test_question_limit_rejects_before_any_work(self, client, monkeypatch):
-        async def at_limit(session, user_id):
-            return 50
+QUESTION = {"connection_id": str(uuid.uuid4()), "nl_query": "total sales?"}
 
-        monkeypatch.setattr(deps.usage, "count_questions_this_month", at_limit)
-        response = client.post("/api/v1/query/", json={"connection_id": str(uuid.uuid4()), "nl_query": "hi"})
 
+@pytest.fixture
+def question_steps(monkeypatch):
+    """Mocks the checks before streaming; records whether the question was reserved."""
+    calls: dict[str, object] = {"reserved": False, "owned": True, "indexed": True, "reserve_error": None}
+
+    async def get_for_user(session, user_id, connection_id):
+        if not calls["owned"]:
+            raise NotFound(errors.CONNECTION_NOT_FOUND)
+        return SimpleNamespace(id=connection_id, encrypted_conn_string="x")
+
+    async def has_elements(session, connection_id):
+        return calls["indexed"]
+
+    async def reserve(session, user_id, connection_id, question, monthly_limit):
+        calls["reserved"] = True
+        calls["monthly_limit"] = monthly_limit
+        if calls["reserve_error"]:
+            raise calls["reserve_error"]
+        return uuid.uuid4()
+
+    async def resume(session, user_id, connection_id, log_id):
+        calls["resumed"] = log_id
+        if calls.get("resume_error"):
+            raise calls["resume_error"]
+        return SimpleNamespace(id=log_id, nl_query="who are our best customers?")
+
+    async def run_pipeline(session, connection_id, url, question, outcome, clarification=None):
+        calls["pipeline"] = (question, clarification)
+        yield {"type": "done"}
+
+    monkeypatch.setattr(query_endpoint.connection_service, "get_for_user", get_for_user)
+    monkeypatch.setattr(query_endpoint, "has_elements", has_elements)
+    monkeypatch.setattr(query_endpoint.query_meter, "resume", resume)
+    monkeypatch.setattr(query_endpoint, "run_pipeline", run_pipeline)
+    monkeypatch.setattr(query_endpoint, "spawn", lambda coro, name: coro.close())
+    monkeypatch.setattr(query_endpoint.query_meter, "reserve", reserve)
+    return calls
+
+
+class TestQuestionGate:
+    """Rejections before the pipeline don't count toward the plan (business-logic.md §2)."""
+
+    def test_foreign_connection_is_404_and_not_counted(self, client, question_steps):
+        question_steps["owned"] = False
+        assert client.post("/api/v1/query/", json=QUESTION).status_code == 404
+        assert question_steps["reserved"] is False
+
+    def test_unindexed_connection_is_400_and_not_counted(self, client, question_steps):
+        question_steps["indexed"] = False
+        assert client.post("/api/v1/query/", json=QUESTION).status_code == 400
+        assert question_steps["reserved"] is False
+
+    def test_monthly_limit_comes_from_the_plan(self, client, question_steps):
+        question_steps["reserve_error"] = LimitReached("QUERY_LIMIT_REACHED")
+        response = client.post("/api/v1/query/", json=QUESTION)
         assert response.status_code == 403
         assert response.json() == {"detail": "QUERY_LIMIT_REACHED"}
+        assert question_steps["monthly_limit"] == 50  # free plan
 
+    def test_one_question_at_a_time(self, client, question_steps):
+        question_steps["reserve_error"] = Conflict(errors.QUESTION_IN_FLIGHT)
+        response = client.post("/api/v1/query/", json=QUESTION)
+        assert response.status_code == 409
+        assert response.json() == {"detail": errors.QUESTION_IN_FLIGHT}
+
+    def test_answering_a_clarification_resumes_instead_of_reserving(self, client, question_steps):
+        question_id = str(uuid.uuid4())
+        body = {**QUESTION, "clarification": {"question_id": question_id, "answer": "By total spent"}}
+        response = client.post("/api/v1/query/", json=body)
+        assert response.status_code == 200
+        assert question_steps["reserved"] is False
+        assert str(question_steps["resumed"]) == question_id
+        # The stored question is used, with the user's answer alongside.
+        assert question_steps["pipeline"] == ("who are our best customers?", "By total spent")
+
+    def test_expired_clarification_is_404(self, client, question_steps):
+        question_steps["resume_error"] = NotFound(errors.CLARIFICATION_EXPIRED)
+        body = {**QUESTION, "clarification": {"question_id": str(uuid.uuid4()), "answer": "x"}}
+        response = client.post("/api/v1/query/", json=body)
+        assert response.status_code == 404
+        assert response.json() == {"detail": errors.CLARIFICATION_EXPIRED}
+
+
+class TestRateLimits:
+    def test_connection_tests_are_limited_per_user(self, client):
+        url = "/api/v1/connections/test"
+        codes = [client.post(url, json={"conn_string": "http://x/"}).status_code for _ in range(11)]
+        assert codes[:10] == [200] * 10
+        assert codes[10] == 429
+        assert client.post(url, json={"conn_string": "http://x/"}).json() == {"detail": errors.TOO_MANY_REQUESTS}
+
+
+class TestPlanLimits:
     def test_connection_limit(self, client, monkeypatch):
         async def one_owned(session, user_id):
             return 1
@@ -71,14 +161,6 @@ class TestPlanLimits:
 
 
 class TestValidation:
-    @pytest.fixture(autouse=True)
-    def under_quota(self, monkeypatch):
-        # Route dependencies (the quota check) run before body validation errors are raised.
-        async def none_used(session, user_id):
-            return 0
-
-        monkeypatch.setattr(deps.usage, "count_questions_this_month", none_used)
-
     @pytest.mark.parametrize("question", ["", "   ", "x" * 2001])
     def test_question_is_bounded_with_a_readable_message(self, client, question):
         response = client.post("/api/v1/query/", json={"connection_id": str(uuid.uuid4()), "nl_query": question})

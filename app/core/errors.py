@@ -9,6 +9,7 @@ import re
 from collections.abc import Iterator
 
 import asyncpg.exceptions as pg_errors
+from google.genai import errors as genai_errors
 from sqlalchemy.exc import ArgumentError
 
 CONNECTION_FAILED = (
@@ -57,6 +58,19 @@ DESIGN_FAILED = (
     "We couldn't generate a schema right now. Please try again in a moment."
 )
 INTERNAL_ERROR = "Something went wrong on our side. Please try again in a moment."
+AI_BUSY = "QueryMind is busy right now. Please try again in a minute."
+WRITE_REQUEST = (
+    "Write-protected. QueryMind only reads your data, so it can't make that change. "
+    "Use your own database tools to change data, or ask a question about it instead."
+)
+CLARIFY_AGAIN = (
+    "I'm still not sure what you mean. Try asking again and name the exact measure you want, "
+    'for example "by total amount spent".'
+)
+CLARIFICATION_EXPIRED = "That question has expired. Please ask it again."
+QUESTION_IN_FLIGHT = "You already have a question running. Wait for it to finish, then ask again."
+QUESTION_STOPPED = "Stopped before finishing."
+TOO_MANY_REQUESTS = "You're going a little fast. Please wait a minute and try again."
 CANNOT_ANSWER = "That isn't in your data. {reason}Try rephrasing, or ask about something your tables record."
 SCHEMA_NOT_INDEXED = (
     "Still mapping your database. We are reading your tables so you can ask questions. "
@@ -160,3 +174,33 @@ def describe_query_error(exc: BaseException, timeout_seconds: int) -> str:
     # SQL errors (undefined column, syntax, bad cast, ...) are about the user's own
     # query and schema; the server's primary message is safe and genuinely useful.
     return SQL_FAILED.format(detail=_postgres_message(pg_error))
+
+
+def is_ai_rate_limited(exc: BaseException) -> bool:
+    """True when Gemini refused the request for quota or rate reasons (HTTP 429)."""
+    return any(
+        isinstance(e, genai_errors.APIError) and getattr(e, "code", None) == 429 for e in _exception_chain(exc)
+    )
+
+
+# SQLSTATE classes the model can fix by rewriting the query: syntax and access-rule errors
+# (undefined column/table/function, grouping, type mismatch), data exceptions (bad cast,
+# division by zero) and "more than one row returned by a subquery".
+_FIXABLE_SQLSTATE_PREFIXES = ("42", "22", "21")
+_UNFIXABLE_SQLSTATES = {"42501"}  # insufficient privilege: a rewrite won't grant access
+
+
+def fixable_sql_error(exc: BaseException) -> str | None:
+    """The database's explanation of a query mistake the model could fix, or None.
+
+    Used as feedback for one retry. Only the server's primary message and hint are kept,
+    credential-redacted; they describe the user's own query and schema.
+    """
+    pg_error = _find_postgres_error(exc)
+    if pg_error is None:
+        return None
+    sqlstate = pg_error.sqlstate or ""
+    if sqlstate in _UNFIXABLE_SQLSTATES or not sqlstate.startswith(_FIXABLE_SQLSTATE_PREFIXES):
+        return None
+    hint = getattr(pg_error, "hint", None)
+    return _postgres_message(pg_error) + (f". Hint: {redact(hint.strip())}" if hint else "")

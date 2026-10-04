@@ -34,6 +34,12 @@ class LimitReached(DomainError):
     status_code = 403
 
 
+class RateLimited(DomainError):
+    """Too many requests from one user in a short time; the request may succeed shortly."""
+
+    status_code = 429
+
+
 class UpstreamFailure(DomainError):
     """An external service (e.g. the AI model) failed; the request may succeed on retry."""
 

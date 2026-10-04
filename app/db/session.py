@@ -1,4 +1,8 @@
 """Async SQLAlchemy engine + session factory for Neon (asyncpg)."""
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+from fastapi import Depends
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -28,7 +32,10 @@ class Base(DeclarativeBase):
     pass
 
 
-async def get_db() -> AsyncSession:  # type: ignore[return]
+async def get_db() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency — yields a database session."""
     async with AsyncSessionLocal() as session:
         yield session
+
+
+DbSession = Annotated[AsyncSession, Depends(get_db)]

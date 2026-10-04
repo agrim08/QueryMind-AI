@@ -18,6 +18,9 @@ SQL_MAX_OUTPUT_TOKENS = 2048
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 768  # Matryoshka-truncated; stored as halfvec(768)
 EMBED_BATCH_SIZE = 100  # max texts per embedding request
+# Tables and views indexed per connection (public schema and tables before views, largest
+# first). Bounds embedding calls and storage for very wide databases.
+MAX_INDEXED_TABLES = 1000
 
 # Retrieval
 # Schemas whose table documents fit this budget go to the model whole: no embedding call,

@@ -14,6 +14,11 @@ SQL_TEMPERATURE = 0.1
 SQL_THINKING_BUDGET = 1024
 SQL_MAX_OUTPUT_TOKENS = 2048
 
+# Business setup (draft a description, extract definitions): once per connection, not per
+# question. No thinking needed for summarising; the JSON output is bounded.
+SETUP_TEMPERATURE = 0.2
+SETUP_MAX_OUTPUT_TOKENS = 4096
+
 # "gemini-embedding-002" does not exist (404); gemini-embedding-2 is the current GA model.
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 768  # Matryoshka-truncated; stored as halfvec(768)

@@ -68,6 +68,16 @@ CLARIFY_AGAIN = (
     'for example "by total amount spent".'
 )
 CLARIFICATION_EXPIRED = "That question has expired. Please ask it again."
+SETUP_CALLS_USED = (
+    "You've used today's AI setup help for this connection. "
+    "You can still edit the definitions yourself, or try again tomorrow."
+)
+SETUP_FAILED = "We couldn't read your business description right now. Please try again in a moment."
+KNOWLEDGE_KIND_INVALID = "Choose a type for this definition: metric, term, filter, convention or table."
+KNOWLEDGE_FULL = "This connection has the maximum number of definitions. Remove some you no longer need."
+KNOWLEDGE_NOT_FOUND = "That definition no longer exists."
+VERIFY_NOT_POSSIBLE = "Only answered questions can be saved as verified."
+VERIFIED_FULL = "This connection has the maximum number of verified answers. Remove some you no longer need."
 QUESTION_IN_FLIGHT = "You already have a question running. Wait for it to finish, then ask again."
 QUESTION_STOPPED = "Stopped before finishing."
 TOO_MANY_REQUESTS = "You're going a little fast. Please wait a minute and try again."

@@ -7,7 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.endpoints import auth, connections, design, query
+from app.api.endpoints import auth, connections, design, knowledge, query
 from app.core.config import settings
 from app.core.exceptions import DomainError
 from app.db.session import engine
@@ -63,6 +63,7 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
 
 app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/users", tags=["auth"])
 app.include_router(connections.router, prefix=f"{settings.API_V1_STR}/connections", tags=["connections"])
+app.include_router(knowledge.router, prefix=f"{settings.API_V1_STR}/connections", tags=["knowledge"])
 app.include_router(query.router, prefix=f"{settings.API_V1_STR}/query", tags=["query"])
 app.include_router(design.router, prefix=f"{settings.API_V1_STR}/design", tags=["design"])
 

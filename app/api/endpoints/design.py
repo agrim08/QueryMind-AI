@@ -1,106 +1,51 @@
+"""Schema Designer endpoints — generate a design, list history, report usage."""
 import logging
-from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Depends, status
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends
+from sqlalchemy import select
 
-from app.schemas.design import GenerateSchemaRequest, DBSchemaDesign
-from app.services.schema_generator import generate_schema_from_prompt
-from app.api.deps import get_current_user_with_entitlements, Entitlements
+from app.api.deps import UNLIMITED, CurrentUser, Plan, require_design_quota
 from app.core import errors
-from app.db.session import get_db
-from app.models.models import User, DesignLog
+from app.core.exceptions import UpstreamFailure
+from app.db.session import DbSession
+from app.models.models import DesignLog
+from app.schemas.design import DBSchemaDesign, DesignLogResponse, GenerateSchemaRequest
+from app.schemas.schemas import UsageResponse
+from app.services import usage
+from app.services.schema_generator import generate_schema_from_prompt
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_UNLIMITED = 999_999_999
 
-
-@router.post("/generate-schema", response_model=DBSchemaDesign)
-async def generate_schema(
-    request: GenerateSchemaRequest,
-    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
-    db: AsyncSession = Depends(get_db),
-):
-    """Generates a structured database schema and saves it to the user's design history."""
-    current_user, entitlements = user_and_ent
-
-    # Enforce monthly design limit for non-unlimited plans
-    if entitlements.max_designs_pm < _UNLIMITED:
-        now = datetime.now(timezone.utc)
-        month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-        monthly_count = await db.scalar(
-            select(func.count(DesignLog.id)).where(
-                DesignLog.user_id == current_user.id,
-                DesignLog.created_at >= month_start,
-            )
-        )
-        if (monthly_count or 0) >= entitlements.max_designs_pm:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="DESIGN_LIMIT_REACHED",
-            )
-
+@router.post("/generate-schema", response_model=DBSchemaDesign, dependencies=[Depends(require_design_quota)])
+async def generate_schema(request: GenerateSchemaRequest, user: CurrentUser, db: DbSession) -> DBSchemaDesign:
+    """Generate a schema design and save it to the user's history (counts toward the plan)."""
     try:
         schema = await generate_schema_from_prompt(request.prompt)
-
-        log = DesignLog(
-            user_id=current_user.id,
-            prompt=request.prompt,
-            schema_json=schema.model_dump(),
-        )
-        db.add(log)
-        await db.commit()
-
-        return schema
-    except HTTPException:
-        raise
     except Exception:
-        logger.exception("Schema generation failed for user %s", current_user.id)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=errors.DESIGN_FAILED,
-        )
+        logger.exception("Schema generation failed for user %s", user.id)
+        raise UpstreamFailure(errors.DESIGN_FAILED) from None
+
+    db.add(DesignLog(user_id=user.id, prompt=request.prompt, schema_json=schema.model_dump()))
+    await db.commit()
+    return schema
 
 
-@router.get("/history")
-async def get_design_history(
-    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
-    db: AsyncSession = Depends(get_db),
-):
-    """Retrieves the design history for the current user."""
-    current_user, _ = user_and_ent
-    try:
-        result = await db.execute(
-            select(DesignLog)
-            .where(DesignLog.user_id == current_user.id)
-            .order_by(DesignLog.created_at.desc())
-        )
-        return result.scalars().all()
-    except Exception:
-        logger.exception("Fetching design history failed for user %s", current_user.id)
-        raise HTTPException(status_code=500, detail="Could not fetch design history")
-
-
-@router.get("/usage")
-async def get_design_usage(
-    user_and_ent: tuple[User, Entitlements] = Depends(get_current_user_with_entitlements),
-    db: AsyncSession = Depends(get_db),
-):
-    """Returns current month's design usage and the plan limit."""
-    current_user, entitlements = user_and_ent
-    now = datetime.now(timezone.utc)
-    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-    count = await db.scalar(
-        select(func.count(DesignLog.id)).where(
-            DesignLog.user_id == current_user.id,
-            DesignLog.created_at >= month_start,
-        )
+@router.get("/history", response_model=list[DesignLogResponse])
+async def get_design_history(user: CurrentUser, db: DbSession) -> list[DesignLogResponse]:
+    """The user's saved designs, newest first."""
+    logs = await db.scalars(
+        select(DesignLog).where(DesignLog.user_id == user.id).order_by(DesignLog.created_at.desc())
     )
-    return {
-        "used": count or 0,
-        "limit": entitlements.max_designs_pm,
-        "unlimited": entitlements.max_designs_pm >= _UNLIMITED,
-    }
+    return [DesignLogResponse.model_validate(log) for log in logs]
+
+
+@router.get("/usage", response_model=UsageResponse)
+async def get_design_usage(user: CurrentUser, plan: Plan, db: DbSession) -> UsageResponse:
+    """This month's design count and the plan limit."""
+    return UsageResponse(
+        used=await usage.count_designs_this_month(db, user.id),
+        limit=plan.max_designs_pm,
+        unlimited=plan.max_designs_pm >= UNLIMITED,
+    )

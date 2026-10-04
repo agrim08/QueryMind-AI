@@ -1,5 +1,5 @@
-"""Schema indexer: introspect a target database, embed one document per table, and
-store the vectors in pgvector (schema_elements).
+"""Schema indexer: introspect a target database, embed one document per table or view,
+and store the vectors in pgvector (schema_elements).
 
 `index_connection` yields progress events for the SSE stream:
   {"type": "status",   "message": "..."}
@@ -13,61 +13,57 @@ rows have replaced the old ones in a single transaction.
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 from datetime import timedelta
 
-from sqlalchemy import func, inspect, or_, text, update
+from sqlalchemy import func, or_, update
 
 from app.core import errors
-from app.core.ai_config import EMBED_BATCH_SIZE
+from app.core.ai_config import EMBED_BATCH_SIZE, MAX_INDEXED_TABLES
 from app.core.exceptions import InvalidInput
 from app.db.session import AsyncSessionLocal
 from app.models.models import DBConnection
 from app.services.embeddings import embed_texts
+from app.services.schema_introspection import TableInfo, introspect
 from app.services.schema_store import NewElement, replace_elements
-from app.services.target_db import decrypt_url, open_target_engine
+from app.services.target_db import decrypt_url
 
 logger = logging.getLogger(__name__)
 
 # A claim older than this is treated as abandoned (e.g. the worker crashed mid-run).
 CLAIM_TTL = timedelta(minutes=15)
-SAMPLE_VALUE_MAX_CHARS = 64
+
+_VIEW_KINDS = {"v": "View", "m": "Materialized view", "f": "Foreign table"}
 
 
-@dataclass(frozen=True)
-class ColumnInfo:
-    name: str
-    type: str
-    nullable: bool
-
-
-@dataclass(frozen=True)
-class ForeignKeyInfo:
-    columns: list[str]
-    referred_table: str
-    referred_columns: list[str]
-
-
-@dataclass
-class TableInfo:
-    name: str
-    columns: list[ColumnInfo]
-    foreign_keys: list[ForeignKeyInfo]
-    sample: dict[str, object] = field(default_factory=dict)
-
-
-def _quote_ident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def build_table_doc(table: TableInfo) -> str:
-    """Text that represents a table for embedding and for the generation prompt."""
-    lines = [f"Table: {table.name}", "Columns:"]
+    """Text that represents a table or view, for embedding and for the generation prompt.
+
+    Deterministic: the same schema always produces the same text. Foreign-key lines keep the
+    form `- (cols) -> table(cols)`, which schema_retriever parses for FK expansion.
+    """
+    header = f"{_VIEW_KINDS.get(table.kind, 'Table')}: {table.display_name}"
+    if table.row_estimate >= 0 and table.kind in ("r", "p", "m"):
+        header += f" (~{table.row_estimate:,} rows)"
+    lines = [header]
+    if table.comment:
+        lines.append(f"Description: {table.comment}")
+    lines.append("Columns:")
     for col in table.columns:
-        sample = table.sample.get(col.name)
-        sample_text = f" (e.g. {str(sample)[:SAMPLE_VALUE_MAX_CHARS]})" if sample not in (None, "") else ""
-        not_null = "" if col.nullable else " NOT NULL"
-        lines.append(f"- {col.name} ({col.type}){not_null}{sample_text}")
+        parts = [f"- {col.name} ({col.type})"]
+        if col.primary_key:
+            parts.append("PRIMARY KEY")
+        elif not col.nullable:
+            parts.append("NOT NULL")
+        if col.values:
+            more = f" (+{col.more_values} more)" if col.more_values else ""
+            parts.append(f"values: {', '.join(_sql_literal(v) for v in col.values)}{more}")
+        if col.comment:
+            parts.append(f"-- {col.comment}")
+        lines.append(" ".join(parts))
     if table.foreign_keys:
         lines.append("Foreign Keys:")
         for fk in table.foreign_keys:
@@ -75,41 +71,6 @@ def build_table_doc(table: TableInfo) -> str:
                 f"- ({', '.join(fk.columns)}) -> {fk.referred_table}({', '.join(fk.referred_columns)})"
             )
     return "\n".join(lines)
-
-
-async def introspect(url: str) -> list[TableInfo]:
-    """Tables, columns, foreign keys and one sample row per table (public schema)."""
-
-    def _inspect(sync_conn) -> list[TableInfo]:
-        inspector = inspect(sync_conn)
-        return [
-            TableInfo(
-                name=name,
-                columns=[
-                    ColumnInfo(c["name"], str(c["type"]), c.get("nullable", True))
-                    for c in inspector.get_columns(name)
-                ],
-                foreign_keys=[
-                    ForeignKeyInfo(fk["constrained_columns"], fk["referred_table"], fk["referred_columns"])
-                    for fk in inspector.get_foreign_keys(name)
-                ],
-            )
-            for name in inspector.get_table_names()
-        ]
-
-    async with open_target_engine(url) as engine, engine.connect() as conn:
-        await conn.execute(text("SET TRANSACTION READ ONLY"))
-        tables = await conn.run_sync(_inspect)
-        for table in tables:
-            try:
-                async with conn.begin_nested():  # a failing sample must not abort the transaction
-                    row = (
-                        await conn.execute(text(f"SELECT * FROM {_quote_ident(table.name)} LIMIT 1"))
-                    ).mappings().first()
-                table.sample = dict(row) if row else {}
-            except Exception as exc:
-                logger.info("Sample row skipped for %s: %s", table.name, type(exc).__name__)
-        return tables
 
 
 async def _claim(connection_id: uuid.UUID) -> bool:
@@ -161,11 +122,15 @@ async def index_connection(
             return
 
         yield {"type": "status", "message": "Connecting to database..."}
-        tables = await introspect(decrypt_url(encrypted_url))
+        schema = await introspect(decrypt_url(encrypted_url))
+        tables = schema.tables
         reading_target = False
 
         total = len(tables)
-        yield {"type": "status", "message": f"Found {total} tables. Building embeddings..."}
+        found = f"Found {total} tables and views"
+        if schema.truncated:
+            found += f" (indexing the {MAX_INDEXED_TABLES:,} largest; more exist)"
+        yield {"type": "status", "message": f"{found}. Building embeddings..."}
         docs = [build_table_doc(t) for t in tables]
         vectors: list[list[float]] = []
         for start in range(0, total, EMBED_BATCH_SIZE):
@@ -174,7 +139,7 @@ async def index_connection(
 
         yield {"type": "status", "message": "Updating search index..."}
         elements = [
-            NewElement(kind="table", schema_name="public", table_name=t.name, doc=doc, embedding=vec)
+            NewElement(kind="table", schema_name=t.schema, table_name=t.name, doc=doc, embedding=vec)
             for t, doc, vec in zip(tables, docs, vectors)
         ]
         async with AsyncSessionLocal() as session:

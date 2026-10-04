@@ -6,10 +6,23 @@ database when their connection or user is deleted (ON DELETE CASCADE).
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import delete, exists, func, insert, select
+from sqlalchemy import case, delete, exists, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import SchemaElement
+
+
+def display_name(schema_name: str, table_name: str) -> str:
+    """How a table is named in documents, prompts and the validator: bare in `public`,
+    schema-qualified elsewhere (e.g. `sales.orders`)."""
+    return table_name if schema_name == "public" else f"{schema_name}.{table_name}"
+
+
+# The same rule in SQL, so lookups by name and the names returned agree with display_name().
+_DISPLAY_NAME = case(
+    (SchemaElement.schema_name == "public", SchemaElement.table_name),
+    else_=SchemaElement.schema_name + "." + SchemaElement.table_name,
+)
 
 
 @dataclass(frozen=True)
@@ -26,7 +39,7 @@ class NewElement:
 class TableDoc:
     """A retrieved table and its document, ranked by similarity to the question."""
 
-    table_name: str
+    table_name: str  # display name: bare in `public`, schema-qualified elsewhere
     doc: str
     score: float
 
@@ -67,7 +80,7 @@ async def has_elements(session: AsyncSession, connection_id: uuid.UUID) -> bool:
 
 
 def _tables(connection_id: uuid.UUID):
-    return select(SchemaElement.table_name, SchemaElement.doc).where(
+    return select(_DISPLAY_NAME.label("table_name"), SchemaElement.doc).where(
         SchemaElement.connection_id == connection_id, SchemaElement.kind == "table"
     )
 
@@ -82,14 +95,14 @@ async def schema_size(session: AsyncSession, connection_id: uuid.UUID) -> int:
 
 
 async def all_tables(session: AsyncSession, connection_id: uuid.UUID) -> list[TableDoc]:
-    rows = await session.execute(_tables(connection_id).order_by(SchemaElement.table_name))
+    rows = await session.execute(_tables(connection_id).order_by(_DISPLAY_NAME))
     return [TableDoc(table_name=r.table_name, doc=r.doc, score=1.0) for r in rows]
 
 
 async def tables_by_name(session: AsyncSession, connection_id: uuid.UUID, names: set[str]) -> list[TableDoc]:
     if not names:
         return []
-    rows = await session.execute(_tables(connection_id).where(SchemaElement.table_name.in_(names)))
+    rows = await session.execute(_tables(connection_id).where(_DISPLAY_NAME.in_(names)))
     return [TableDoc(table_name=r.table_name, doc=r.doc, score=0.0) for r in rows]
 
 
@@ -103,7 +116,7 @@ async def search_tables(
     thousand rows, so an ANN index isn't needed at this scale."""
     distance = SchemaElement.embedding.cosine_distance(query_vector)
     rows = await session.execute(
-        select(SchemaElement.table_name, SchemaElement.doc, distance.label("distance"))
+        select(_DISPLAY_NAME.label("table_name"), SchemaElement.doc, distance.label("distance"))
         .where(SchemaElement.connection_id == connection_id, SchemaElement.kind == "table")
         .order_by(distance)
         .limit(limit)

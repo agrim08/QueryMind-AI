@@ -1,0 +1,20 @@
+# Business definitions for the Chinook eval (python -m evals.run --knowledge).
+# Short, true statements about this data, like BIRD's per-question "evidence" sentences.
+# They're loaded as the eval connection's definitions; without --knowledge they're cleared.
+
+definitions:
+  - kind: metric
+    name: revenue
+    definition: SUM(invoice.total) overall or by customer/country/date; SUM(invoice_line.unit_price * invoice_line.quantity) when split by track, album, genre or artist.
+  - kind: term
+    name: sales
+    definition: Same as revenue (money from invoices), not a count of invoices.
+  - kind: term
+    name: support rep
+    definition: The employee who looks after a customer, via customer.support_rep_id = employee.employee_id.
+  - kind: table_note
+    name: playlist_track
+    definition: Links playlists to tracks; one row per track on a playlist.
+  - kind: convention
+    name: currency
+    definition: All prices and totals are in US dollars.

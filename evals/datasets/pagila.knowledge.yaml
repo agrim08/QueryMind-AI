@@ -1,0 +1,21 @@
+# Business definitions for the Pagila eval (python -m evals.run --knowledge). See chinook.knowledge.yaml.
+
+definitions:
+  - kind: metric
+    name: revenue
+    definition: SUM(payment.amount). A store's revenue follows payment → rental → inventory.store_id.
+  - kind: term
+    name: active customer
+    definition: customer.active = 1.
+  - kind: term
+    name: rented
+    definition: A film was rented when its inventory copy appears in rental (rental.inventory_id → inventory.film_id).
+  - kind: table_note
+    name: film_category
+    definition: Links films to categories; one row per film and category.
+  - kind: table_note
+    name: film_actor
+    definition: Links actors to the films they appear in.
+  - kind: convention
+    name: text case
+    definition: Film titles and actor names are stored in UPPER CASE.

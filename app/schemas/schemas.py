@@ -1,75 +1,95 @@
-"""Pydantic v2 schemas for request/response validation."""
+"""Pydantic v2 schemas for request/response validation.
+
+Every inbound string is bounded (see .claude/rules/security.md §7).
+"""
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Annotated
 
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, ConfigDict, StringConstraints
+
+
+# Trimmed, non-empty strings with an upper bound.
+Email = Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=320)]
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+ConnectionString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)]
+Question = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 
 
 # ── User ──────────────────────────────────────────────────────────────────────
 
 class UserSyncRequest(BaseModel):
-    clerk_id: str
-    email: str
-    full_name: Optional[str] = None
-    avatar_url: Optional[str] = None
+    """Profile fields only. The Clerk user id always comes from the verified token."""
+
+    email: Email
+    full_name: Annotated[str, StringConstraints(max_length=255)] | None = None
+    avatar_url: Annotated[str, StringConstraints(max_length=2048)] | None = None
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     clerk_id: str
     email: str
-    full_name: Optional[str] = None
-    avatar_url: Optional[str] = None
+    full_name: str | None = None
+    avatar_url: str | None = None
     created_at: datetime
-
-    model_config = {"from_attributes": True}
 
 
 # ── DB Connection ─────────────────────────────────────────────────────────────
 
 class DBConnectionCreate(BaseModel):
-    name: str
-    connection_string: str  # raw — will be encrypted before storage
+    name: Name
+    connection_string: ConnectionString  # raw — normalised and encrypted before storage
+
+
+class ConnectionTestRequest(BaseModel):
+    conn_string: ConnectionString
+
+
+class ConnectionTestResponse(BaseModel):
+    ok: bool
+    error: str | None = None
 
 
 class DBConnectionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     name: str
-    pinecone_namespace: Optional[str] = None
-    table_count: Optional[int] = None
-    indexed_at: Optional[datetime] = None
+    table_count: int | None = None
+    indexed_at: datetime | None = None
     is_active: bool
     created_at: datetime
-
-    model_config = {"from_attributes": True}
 
 
 # ── Query ─────────────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
     connection_id: uuid.UUID
-    nl_query: str
-
-
-class QueryResult(BaseModel):
-    columns: list[str]
-    rows: list[list]
-    exec_time_ms: int
-    row_count: int
+    nl_query: Question
 
 
 # ── Query Log ─────────────────────────────────────────────────────────────────
 
 class QueryLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     connection_id: uuid.UUID
     nl_query: str
-    generated_sql: Optional[str] = None
-    row_count: Optional[int] = None
-    exec_time_ms: Optional[int] = None
+    generated_sql: str | None = None
+    row_count: int | None = None
+    exec_time_ms: int | None = None
     status: str
-    error_message: Optional[str] = None
+    error_message: str | None = None
     created_at: datetime
 
-    model_config = {"from_attributes": True}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+
+class UsageResponse(BaseModel):
+    used: int
+    limit: int
+    unlimited: bool

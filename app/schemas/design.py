@@ -1,5 +1,11 @@
-from typing import List, Optional
-from pydantic import BaseModel, Field
+import uuid
+from datetime import datetime
+from typing import Annotated, List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+DesignPrompt = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
+
 
 class DBColumn(BaseModel):
     name: str = Field(description="Name of the column")
@@ -24,4 +30,17 @@ class DBSchemaDesign(BaseModel):
     edges: List[DBEdge] = Field(description="List of foreign key relationships between tables")
 
 class GenerateSchemaRequest(BaseModel):
-    prompt: str = Field(description="The natural language prompt describing the system to design")
+    prompt: DesignPrompt = Field(description="The natural language prompt describing the system to design")
+
+
+class DesignLogResponse(BaseModel):
+    """A saved design from the user's history."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    prompt: str
+    # Exposed as "schema_json" (the ORM column and API field); renamed in Python because
+    # `schema_json` would shadow a BaseModel method.
+    design: dict = Field(validation_alias="schema_json", serialization_alias="schema_json")
+    created_at: datetime

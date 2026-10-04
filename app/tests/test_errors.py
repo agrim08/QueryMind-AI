@@ -85,3 +85,16 @@ class TestDescribeQueryError:
         message = errors.describe_query_error(exc, 10)
         assert "pinecone" not in message.lower()
         assert "internal.svc" not in message
+
+
+class TestCannotAnswer:
+    def test_reason_is_capitalised_and_punctuated(self):
+        assert errors.describe_cannot_answer("artists have no phone column") == (
+            "That isn't in your data. Artists have no phone column. "
+            "Try rephrasing, or ask about something your tables record."
+        )
+
+    def test_without_a_reason(self):
+        assert errors.describe_cannot_answer("  ") == (
+            "That isn't in your data. Try rephrasing, or ask about something your tables record."
+        )

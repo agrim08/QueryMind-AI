@@ -143,3 +143,44 @@ class TestEdgeCases:
             "SELECT * FROM public.users", known_tables=["users"]
         )
         assert result.is_valid  # strips schema prefix
+
+
+class TestKnownTablesFromKeyword:
+    """FROM also appears inside expressions; only FROM/JOIN clauses name tables (eval case c08)."""
+
+    KNOWN = ["invoice", "customer"]
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT SUM("i"."total") FROM "invoice" AS "i" WHERE EXTRACT(YEAR FROM "i"."invoice_date") = 2023',
+            "SELECT extract(month from invoice_date), count(*) FROM invoice GROUP BY 1",
+            "SELECT SUBSTRING(billing_city FROM 1 FOR 3) FROM invoice",
+            "SELECT TRIM(BOTH ' ' FROM billing_city) FROM invoice",
+            "SELECT OVERLAY(billing_city PLACING 'X' FROM 1 FOR 1) FROM invoice",
+            "SELECT * FROM invoice WHERE billing_state IS DISTINCT FROM 'CA'",
+            "SELECT * FROM invoice WHERE billing_state IS NOT DISTINCT FROM NULL",
+            "SELECT * FROM invoice WHERE billing_city = 'from paris' OR billing_city = 'join us'",
+            "SELECT EXTRACT(YEAR FROM i.invoice_date) FROM invoice i JOIN customer c USING (customer_id)",
+        ],
+    )
+    def test_expression_from_is_not_a_table(self, sql):
+        result = validate_sql(sql, known_tables=self.KNOWN)
+        assert result.is_valid, result.error
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT EXTRACT(YEAR FROM invoice_date) FROM secret_table",
+            "SELECT * FROM invoice JOIN secret_table USING (customer_id)",
+            # A subquery inside EXTRACT still has its tables checked.
+            "SELECT EXTRACT(YEAR FROM (SELECT max(created_at) FROM secret_table)) FROM invoice",
+            "SELECT * FROM invoice WHERE customer_id IN (SELECT id FROM secret_table)",
+            # A string literal can't hide a real table reference after it.
+            "SELECT 'from x' AS note FROM secret_table",
+        ],
+    )
+    def test_unknown_tables_are_still_rejected(self, sql):
+        result = validate_sql(sql, known_tables=self.KNOWN)
+        assert not result.is_valid
+        assert "secret_table" in result.error

@@ -1,10 +1,5 @@
 """Unit tests for sql_validator — run with: pytest app/tests/test_sql_validator.py -v"""
 import pytest
-import sys
-import os
-
-# Ensure the backend root is on the path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from app.services.sql_validator import validate_sql
 

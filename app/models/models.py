@@ -1,16 +1,18 @@
 """SQLAlchemy ORM models for the QueryMind application database."""
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     Boolean,
     Computed,
+    Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
@@ -98,6 +100,10 @@ class QueryLog(Base):
     exec_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The question this one follows up ("now only Europe"); its question and SQL are context.
+    follow_up_of: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("query_logs.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -164,3 +170,76 @@ class SchemaElement(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class BusinessContext(Base):
+    """What the user told us about their business, per connection (Phase 3).
+
+    The description is the user's own words (or an AI draft they kept); the knowledge items
+    extracted from it live in KnowledgeItem. Starter questions fill the empty dashboard.
+    """
+
+    __tablename__ = "business_contexts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("db_connections.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    starter_questions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Daily cap on setup AI calls (draft / extract), counted per UTC day.
+    setup_calls_day: Mapped[date | None] = mapped_column(Date, nullable=True)
+    setup_calls_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class KnowledgeItem(Base):
+    """One short definition the model should follow: a metric, a term, a default filter, a
+    convention, a note on a table, or the answer to an earlier clarifying question."""
+
+    __tablename__ = "knowledge_items"
+    __table_args__ = (Index("ix_knowledge_items_connection_id", "connection_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("db_connections.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    definition: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # ai | user | clarification
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class VerifiedQuery(Base):
+    """A question and SQL the user confirmed as right (👍). Similar questions get it as a
+    worked example, so answers improve with use."""
+
+    __tablename__ = "verified_queries"
+    __table_args__ = (
+        Index("ix_verified_queries_connection_id", "connection_id"),
+        UniqueConstraint("connection_id", "question", name="uq_verified_queries_connection_question"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("db_connections.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    sql: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

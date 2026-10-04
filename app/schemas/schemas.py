@@ -78,6 +78,8 @@ class QueryRequest(BaseModel):
     nl_query: Question
     # Set when answering a clarifying question; the question then continues (one count).
     clarification: ClarificationAnswer | None = None
+    # The earlier question this one follows up ("now only Europe"); from the results event.
+    follow_up_of: uuid.UUID | None = None
 
 
 # ── Query Log ─────────────────────────────────────────────────────────────────
@@ -93,6 +95,21 @@ class QueryLogResponse(BaseModel):
     exec_time_ms: int | None = None
     status: str
     error_message: str | None = None
+    follow_up_of: uuid.UUID | None = None
+    created_at: datetime
+
+
+class QueryHistoryResponse(BaseModel):
+    items: list[QueryLogResponse]
+    total: int
+
+
+class VerifiedQueryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    question: str
+    sql: str
     created_at: datetime
 
 

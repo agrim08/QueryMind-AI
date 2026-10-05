@@ -83,7 +83,10 @@ class DBConnection(Base):
 
 class QueryLog(Base):
     __tablename__ = "query_logs"
-    __table_args__ = (Index("ix_query_logs_user_id_created_at", "user_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_query_logs_user_id_created_at", "user_id", "created_at"),
+        Index("ix_query_logs_connection_id_prompt_hash", "connection_id", "prompt_hash"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -104,6 +107,13 @@ class QueryLog(Base):
     follow_up_of: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("query_logs.id", ondelete="SET NULL"), nullable=True
     )
+    # What the user saw (headline, chart, first rows; services/answer_snapshot.py). Deferred:
+    # only the History "answer" endpoint loads it.
+    answer_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True, deferred=True)
+    # Fingerprint of the first Gemini request for this question (services/answer_cache.py).
+    prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Milliseconds at each step of answering (query_pipeline milestones + setup), for latency reports.
+    timings: Mapped[dict | None] = mapped_column(JSONB, nullable=True, deferred=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

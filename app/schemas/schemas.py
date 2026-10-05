@@ -4,7 +4,7 @@ Every inbound string is bounded (see .claude/rules/security.md §7).
 """
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
@@ -80,6 +80,8 @@ class QueryRequest(BaseModel):
     clarification: ClarificationAnswer | None = None
     # The earlier question this one follows up ("now only Europe"); from the results event.
     follow_up_of: uuid.UUID | None = None
+    # Ask the model again instead of reusing an earlier answer to the same request.
+    fresh: bool = False
 
 
 # ── Query Log ─────────────────────────────────────────────────────────────────
@@ -97,11 +99,26 @@ class QueryLogResponse(BaseModel):
     error_message: str | None = None
     follow_up_of: uuid.UUID | None = None
     created_at: datetime
+    # Set by the history endpoint: the answer is saved as verified (👍); the model's restatement
+    # of the question; the statement that ran, without QueryMind's comment lines.
+    verified: bool = False
+    understood: str | None = None
+    sql: str | None = None
 
 
 class QueryHistoryResponse(BaseModel):
     items: list[QueryLogResponse]
     total: int
+
+
+class AnswerSnapshotResponse(BaseModel):
+    """The answer saved with a question: its presentation (headline, chart) and first rows."""
+
+    answer: dict[str, Any]
+    columns: list[str]
+    rows: list[list[Any]]  # at most answer_snapshot.MAX_ROWS
+    row_count: int  # rows the query returned when it ran
+    truncated: bool  # the query had more rows than the 500-row cap
 
 
 class VerifiedQueryResponse(BaseModel):

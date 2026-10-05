@@ -9,7 +9,8 @@
                         "answer": {intent, understood, assumptions, alternatives, follow_ups,
                                    headline, chart},        # see answer_presentation
                         "verified_match": "..." | null,     # a close verified question used
-                        "knowledge_used": [...]}            # names of definitions sent
+                        "knowledge_used": [...],            # names of definitions sent
+                        "reused": bool}                     # an earlier reply, no new Gemini call
   {"type": "clarify",   "question": "...", "options": [...], "understood": "..."}
   {"type": "message",   "text": "..."}        # a plain answer about the database itself
   {"type": "done"}
@@ -25,15 +26,16 @@ What happened is recorded in a `PipelineOutcome`, which the caller writes to the
 QueryLog row (see query_meter) when the stream ends.
 """
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import errors
-from app.services import schema_answers, verified_queries
+from app.services import answer_cache, schema_answers, verified_queries
 from app.services.answer_presentation import Presentation, present
 from app.services.prompt_context import PromptContext, select_knowledge
 from app.services.question_context import QuestionContext
@@ -41,7 +43,7 @@ from app.services.query_executor import STATEMENT_TIMEOUT_MS, QueryResult, execu
 from app.services.reply_format import SqlReply, SqlStreamFilter, parse_reply
 from app.services.schema_retriever import retrieve_schema
 from app.services.schema_store import all_tables, tables_by_name
-from app.services.sql_generator import RetryFeedback, stream_sql
+from app.services.sql_generator import RetryFeedback, request_fingerprint, stream_sql
 from app.services.sql_validator import validate_sql
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,17 @@ class PipelineOutcome:
     attempts: int = 0
     kind: AnswerKind | None = None
     reply: SqlReply | None = None
+    answer: dict | None = None  # the presentation sent with the results (for the snapshot)
+    prompt_hash: str | None = None  # fingerprint of the first Gemini request (answer_cache)
+    reused: bool = False  # the reply came from an earlier answer, not a new Gemini call
+    # Milliseconds since the pipeline started at each milestone (stored for latency reports):
+    # retrieved, first_sql, generated, validated, executed, total; the endpoint adds setup.
+    timings: dict[str, int] = field(default_factory=dict)
+    started: float = field(default_factory=time.perf_counter)
+
+    def mark(self, milestone: str, first_only: bool = False) -> None:
+        if not (first_only and milestone in self.timings):
+            self.timings[milestone] = int((time.perf_counter() - self.started) * 1000)
 
 
 def describe_failure(exc: Exception, step: Step) -> str:
@@ -100,9 +113,12 @@ async def run_pipeline(
     outcome: PipelineOutcome,
     clarification: str | None = None,
     context: QuestionContext | None = None,
+    reuse_for_user: uuid.UUID | None = None,
 ) -> AsyncIterator[dict]:
     """Answer `question`; `clarification` is the user's answer to a clarifying question, and
-    `context` the connection's knowledge, verified examples and conversation (question_context)."""
+    `context` the connection's knowledge, verified examples and conversation (question_context).
+    With `reuse_for_user`, that user's earlier reply to exactly the same request is reused
+    instead of a new Gemini call (answer_cache); None always asks the model (evals, "fresh")."""
     context = context or QuestionContext()
     step: Step = "retrieve"
     try:
@@ -116,6 +132,7 @@ async def run_pipeline(
 
         yield {"type": "status", "message": "Retrieving schema context..."}
         table_docs = await retrieve_schema(session, connection_id, question)
+        outcome.mark("retrieved")
         prompt_context = PromptContext(
             knowledge=tuple(select_knowledge(list(context.knowledge), question, [d.table_name for d in table_docs])),
             examples=context.examples,
@@ -123,23 +140,41 @@ async def run_pipeline(
         )
         strong = [e for e in context.examples if e.similarity >= verified_queries.STRONG_MATCH]
 
+        outcome.prompt_hash = request_fingerprint(question, table_docs, None, clarification, prompt_context)
+        earlier = (
+            await answer_cache.earlier_reply(session, reuse_for_user, connection_id, outcome.prompt_hash)
+            if reuse_for_user
+            else None
+        )
+
         feedback: RetryFeedback | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             outcome.attempts = attempt
             step = "generate"
-            if feedback is None:
-                yield {"type": "status", "message": "Generating SQL..."}
-            else:
-                yield {"type": "retry", "message": "Fixing the query..."}
-            outcome.generated_sql = ""
-            shown = SqlStreamFilter()
-            async for chunk in stream_sql(question, table_docs, feedback, clarification, prompt_context):
-                outcome.generated_sql += chunk
-                if sql_text := shown.feed(chunk):
+            if attempt == 1 and earlier:
+                # Same request as before: reuse the reply; the SQL is still validated and run.
+                yield {"type": "status", "message": "Reusing your earlier answer to this question..."}
+                outcome.generated_sql, outcome.reused = earlier, True
+                if sql_text := parse_reply(earlier).sql:
+                    outcome.mark("first_sql", first_only=True)
                     yield {"type": "sql_chunk", "chunk": sql_text}
-            if sql_text := shown.finish():
-                yield {"type": "sql_chunk", "chunk": sql_text}
+            else:
+                if feedback is None:
+                    yield {"type": "status", "message": "Generating SQL..."}
+                else:
+                    yield {"type": "retry", "message": "Fixing the query..."}
+                outcome.generated_sql, outcome.reused = "", False
+                shown = SqlStreamFilter()
+                async for chunk in stream_sql(question, table_docs, feedback, clarification, prompt_context):
+                    outcome.generated_sql += chunk
+                    if sql_text := shown.feed(chunk):
+                        outcome.mark("first_sql", first_only=True)
+                        yield {"type": "sql_chunk", "chunk": sql_text}
+                if sql_text := shown.finish():
+                    outcome.mark("first_sql", first_only=True)
+                    yield {"type": "sql_chunk", "chunk": sql_text}
             outcome.generated_sql = outcome.generated_sql.strip()
+            outcome.mark("generated")
             reply = outcome.reply = parse_reply(outcome.generated_sql)
 
             step = "validate"
@@ -190,6 +225,7 @@ async def run_pipeline(
                 yield {"type": "error", "message": validation.error}
                 return
 
+            outcome.mark("validated")
             step = "execute"
             yield {"type": "status", "message": "Executing query..."}
             try:
@@ -202,7 +238,9 @@ async def run_pipeline(
                     continue
                 raise
 
+            outcome.mark("executed")
             outcome.kind, outcome.status, outcome.result = "rows", "success", result
+            outcome.answer = _presentation(reply, result).to_dict()
             yield {
                 "type": "results",
                 "sql": reply.sql,
@@ -211,10 +249,11 @@ async def run_pipeline(
                 "exec_time_ms": result.exec_time_ms,
                 "row_count": result.row_count,
                 "truncated": result.truncated,
-                "answer": _presentation(reply, result).to_dict(),
+                "answer": outcome.answer,
                 # The user's own verified question this answer was based on, when one was close.
                 "verified_match": strong[0].question if strong else None,
                 "knowledge_used": [e.name for e in prompt_context.knowledge],
+                "reused": outcome.reused,
             }
             yield {"type": "done"}
             return
@@ -231,3 +270,5 @@ async def run_pipeline(
         else:
             logger.exception("Query pipeline failed at step %r (connection %s)", step, connection_id)
         yield {"type": "error", "message": outcome.error_message}
+    finally:
+        outcome.mark("total")

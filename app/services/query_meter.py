@@ -10,18 +10,21 @@ counts even if the worker crashes before `finish` runs.
 `finish` writes the outcome to that row when the stream ends, including when the client
 disconnects mid-answer (the question is then recorded as stopped).
 """
+import logging
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import Exists, exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import errors
 from app.core.exceptions import Conflict, LimitReached, NotFound
 from app.db.session import AsyncSessionLocal
 from app.models.models import QueryLog, User
-from app.services import usage
+from app.services import answer_snapshot, usage
 from app.services.query_pipeline import PipelineOutcome
+
+logger = logging.getLogger(__name__)
 
 # A pending row older than this belongs to a crashed worker and no longer blocks the user.
 # Comfortably above the longest answer: generation, one retry and two 10 s executions.
@@ -30,18 +33,16 @@ IN_FLIGHT_WINDOW = timedelta(minutes=2)
 CLARIFICATION_WINDOW = timedelta(minutes=30)
 
 
-async def _has_question_in_flight(session: AsyncSession, user_id: uuid.UUID) -> bool:
-    return bool(
-        await session.scalar(
-            select(
-                exists().where(
-                    QueryLog.user_id == user_id,
-                    QueryLog.status == "pending",
-                    QueryLog.created_at > func.now() - IN_FLIGHT_WINDOW,
-                )
-            )
-        )
+def _question_in_flight(user_id: uuid.UUID) -> Exists:
+    return exists().where(
+        QueryLog.user_id == user_id,
+        QueryLog.status == "pending",
+        QueryLog.created_at > func.now() - IN_FLIGHT_WINDOW,
     )
+
+
+async def _has_question_in_flight(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    return bool(await session.scalar(select(_question_in_flight(user_id))))
 
 
 async def reserve(
@@ -60,10 +61,14 @@ async def reserve(
     # Serialises this user's reservations; other users are unaffected.
     await session.execute(select(User.id).where(User.id == user_id).with_for_update())
 
-    if await _has_question_in_flight(session, user_id):
+    # Both checks in one round trip (each one is ~300 ms to a distant database).
+    in_flight, used = (
+        await session.execute(select(_question_in_flight(user_id), usage.questions_this_month(user_id)))
+    ).one()
+    if in_flight:
         await session.rollback()
         raise Conflict(errors.QUESTION_IN_FLIGHT)
-    if await usage.count_questions_this_month(session, user_id) >= monthly_limit:
+    if used >= monthly_limit:
         await session.rollback()
         raise LimitReached("QUERY_LIMIT_REACHED")
 
@@ -127,8 +132,18 @@ async def finish(log_id: uuid.UUID, outcome: PipelineOutcome) -> None:
                 generated_sql=outcome.generated_sql or None,
                 row_count=outcome.result.row_count if outcome.result else None,
                 exec_time_ms=outcome.result.exec_time_ms if outcome.result else None,
+                prompt_hash=outcome.prompt_hash,
+                timings=outcome.timings or None,
+                # Built here, after the stream, so it never delays the answer.
+                answer_snapshot=(
+                    answer_snapshot.build(outcome.answer, outcome.result)
+                    if outcome.result and outcome.answer is not None
+                    else None
+                ),
                 status=status,
                 error_message=message,
             )
         )
         await session.commit()
+    # One line per question, so latency regressions show in the logs too.
+    logger.info("Question %s %s in %s ms: %s", log_id, status, outcome.timings.get("total"), outcome.timings)

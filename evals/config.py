@@ -34,12 +34,17 @@ def database_url(database: str) -> str:
 
 @dataclass(frozen=True)
 class Source:
-    """A sample database: SQL scripts applied in order to an empty database."""
+    """A sample database: SQL scripts applied in order to an empty database, or a copy of
+    another loaded one (`template`), optionally with look-alike tables added (`distractors`)."""
 
     database: str
-    scripts: tuple[str, ...]
+    scripts: tuple[str, ...] = ()
     # Chinook's script runs DROP/CREATE DATABASE and \c itself, so it starts in `postgres`.
     script_creates_database: bool = False
+    template: str | None = None  # copy this loaded database instead of running scripts
+    distractors: bool = False  # add ~180 look-alike tables (evals/distractors.py)
+    cases: str | None = None  # questions file (datasets/<cases>.yaml); default: the dataset's name
+    in_daily_run: bool = True  # the scheduled run and a bare `evals.run` include it
 
 
 # Pinned to tags so scores stay comparable between runs. Pagila v4 needs Postgres 18.
@@ -59,4 +64,20 @@ SOURCES: dict[str, Source] = {
             "https://raw.githubusercontent.com/devrimgunduz/pagila/pagila-v3.1.0/pagila-data.sql",
         ),
     ),
+    # Large-schema variants (Phase 4.2): the same data and questions among ~180 decoy tables,
+    # beyond the size that is sent to the model whole, so retrieval has to find the tables.
+    # Run by name: they'd take the daily budget from the base datasets.
+    "chinook_xl": Source(
+        database="chinook_xl", template="chinook", distractors=True, cases="chinook", in_daily_run=False
+    ),
+    "pagila_xl": Source(
+        database="pagila_xl", template="pagila", distractors=True, cases="pagila", in_daily_run=False
+    ),
 }
+
+DAILY_DATASETS = sorted(name for name, source in SOURCES.items() if source.in_daily_run)
+
+
+def cases_file(dataset: str) -> str:
+    """The questions file a dataset uses (a large variant shares its base dataset's)."""
+    return SOURCES[dataset].cases or dataset

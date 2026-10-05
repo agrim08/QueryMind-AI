@@ -7,6 +7,7 @@ runs together never take more than DAILY_EVAL_BUDGET. It can't see the app's own
 import json
 from datetime import date, datetime, time, timedelta, timezone
 
+from app.core import errors
 from evals.config import DAILY_EVAL_BUDGET, QUOTA_LEDGER_FILE
 
 # Days of ledger history to keep.
@@ -51,3 +52,10 @@ class QuotaLedger:
         self._calls = {day: n for day, n in self._calls.items() if day >= cutoff}
         QUOTA_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         QUOTA_LEDGER_FILE.write_text(json.dumps(self._calls, indent=2), encoding="utf-8")
+
+
+def is_refusal(error: str | None) -> bool:
+    """Gemini didn't answer (quota or rate limit): that says nothing about accuracy, so the
+    question is retried next run. A 429 reaches the user as AI_BUSY; other generation failures
+    as GENERATION_FAILED."""
+    return error in (errors.AI_BUSY, errors.GENERATION_FAILED)

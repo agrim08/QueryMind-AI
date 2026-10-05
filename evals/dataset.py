@@ -5,7 +5,7 @@ import yaml
 
 from app.services.knowledge import ItemDraft
 from app.services.sql_validator import table_references
-from evals.config import DATASETS_DIR
+from evals.config import DATASETS_DIR, cases_file
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ class Case:
 
 
 def load_cases(dataset: str) -> list[Case]:
-    raw = yaml.safe_load((DATASETS_DIR / f"{dataset}.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load((DATASETS_DIR / f"{cases_file(dataset)}.yaml").read_text(encoding="utf-8"))
     cases = []
     for item in raw["cases"]:
         gold = item.get("gold", ())
@@ -52,7 +52,7 @@ def needed_tables(gold_sql: str) -> set[str]:
 
 def load_knowledge(dataset: str) -> list[ItemDraft]:
     """The dataset's business definitions (`<name>.knowledge.yaml`), like BIRD's evidence."""
-    path = DATASETS_DIR / f"{dataset}.knowledge.yaml"
+    path = DATASETS_DIR / f"{cases_file(dataset)}.knowledge.yaml"
     if not path.exists():
         return []
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))

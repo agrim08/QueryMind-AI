@@ -16,8 +16,8 @@ import sys
 import time
 from pathlib import Path
 
-from evals.config import DAILY_LOG_FILE, SOURCES
-from evals.setup import start_container
+from evals.config import DAILY_DATASETS, DAILY_LOG_FILE
+from evals.setup import prepare_app_database, start_container
 
 logger = logging.getLogger("evals.daily")
 
@@ -65,7 +65,8 @@ def main() -> None:
     try:
         ensure_docker()
         start_container()
-        asyncio.run(run.run_evals(sorted(SOURCES)))
+        prepare_app_database()  # new app migrations reach the eval database too
+        asyncio.run(run.run_evals(DAILY_DATASETS))
     except Exception:
         logger.exception("Daily eval failed; the next run will pick up where this one stopped")
         sys.exit(1)

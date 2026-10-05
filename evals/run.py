@@ -1,9 +1,13 @@
 """Run the accuracy eval: python -m evals.run [dataset ...] [options]  (from backend/, after evals.setup)
 
-  (no dataset)     all datasets
+  (no dataset)     the daily datasets (chinook, pagila); name chinook_xl / pagila_xl to run those
   --core           only the core set (15 questions, every question type)
   --ids c01,p05    only these cases
   --budget N       at most N new Gemini calls this run (never more than today's eval budget)
+  --thinking N     Gemini thinking budget for this run (default: the app's SQL_THINKING_BUDGET);
+                   answers are cached per budget, so runs can be compared
+  --until-quota    ignore the daily eval budget: call Gemini until it refuses (spends the app's
+                   share of today's quota too; for a deliberate catch-up run)
   --check-gold     run only the gold queries (no Gemini calls) and show their row counts
   --reindex        rebuild the schema indexes first (one embedding call per 100 tables)
   --interval S     seconds between Gemini calls (keeps inside the free tier's per-minute limit)
@@ -30,6 +34,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
+from contextlib import aclosing  # noqa: E402
 from dataclasses import asdict, dataclass  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 
@@ -42,12 +47,13 @@ from app.db.session import AsyncSessionLocal, engine  # noqa: E402
 from app.models.models import DBConnection, User  # noqa: E402
 from app.services import knowledge, query_pipeline, question_context, sql_generator  # noqa: E402
 from app.services.query_executor import QueryResult, execute_query  # noqa: E402
-from app.services.query_pipeline import PipelineOutcome, run_pipeline  # noqa: E402
+from app.services.query_pipeline import MAX_ATTEMPTS, PipelineOutcome, run_pipeline  # noqa: E402
 from app.services.schema_indexer import index_connection  # noqa: E402
 from app.services.schema_retriever import retrieve_schema  # noqa: E402
 from evals.compare import compare_results  # noqa: E402
-from evals.config import DEFAULT_INTERVAL_S, REPORTS_DIR, SOURCES  # noqa: E402
+from evals.config import DAILY_DATASETS, DEFAULT_INTERVAL_S, REPORTS_DIR, SOURCES  # noqa: E402
 from evals.dataset import Case, load_cases, load_knowledge  # noqa: E402
+from evals.quota import is_refusal  # noqa: E402
 from evals.generation_cache import GenerationCache, request_key  # noqa: E402
 from evals.quota import QuotaLedger  # noqa: E402
 
@@ -117,11 +123,15 @@ async def ensure_connection(dataset: str) -> DBConnection:
 async def ensure_indexed(connection: DBConnection, force: bool) -> None:
     if connection.indexed_at is not None and not force:
         return
-    async for event in index_connection(connection.id, connection.user_id, connection.encrypted_conn_string):
-        if event["type"] == "error":
-            raise RuntimeError(f"Indexing {connection.name} failed: {event['message']}")
-        if event["type"] == "done":
-            logger.info("Indexed %s: %d tables", connection.name, event["table_count"])
+    # aclosing: raising mid-stream must still run the indexer's cleanup (it releases its claim).
+    async with aclosing(index_connection(connection.id, connection.user_id, connection.encrypted_conn_string)) as events:
+        async for event in events:
+            if event["type"] == "error":
+                raise RuntimeError(f"Indexing {connection.name} failed: {event['message']}")
+            if event["type"] == "status":
+                logger.info("%s: %s", connection.name, event["message"])
+            if event["type"] == "done":
+                logger.info("Indexed %s: %d tables", connection.name, event["table_count"])
 
 
 async def gold_results(connection: DBConnection, case: Case) -> list[QueryResult]:
@@ -207,7 +217,13 @@ def summarize(results: list[CaseResult], pending: list[str]) -> dict:
 
 def render_markdown(stamp: str, results: list[CaseResult], summaries: dict[str, dict], with_knowledge: bool) -> str:
     context = "on" if with_knowledge else "off"
-    lines = [f"# Eval report {stamp}", "", f"Model: `{GENERATION_MODEL}` · business definitions: {context}", ""]
+    lines = [
+        f"# Eval report {stamp}",
+        "",
+        f"Model: `{GENERATION_MODEL}` · business definitions: {context} · "
+        f"thinking budget: {sql_generator.SQL_THINKING_BUDGET}",
+        "",
+    ]
     for dataset, s in summaries.items():
         score = f"{s['passed']}/{s['scored']} ({s['accuracy']:.0%})" if s["scored"] else "nothing scored"
         lines += [f"## {dataset}: {score}", ""]
@@ -242,6 +258,7 @@ def write_report(results: list[CaseResult], summaries: dict[str, dict], with_kno
     report = {
         "model": GENERATION_MODEL,
         "business_definitions": with_knowledge,
+        "thinking_budget": sql_generator.SQL_THINKING_BUDGET,
         "created_at": stamp,
         "summaries": summaries,
         "cases": [{**asdict(r), "passed": r.passed} for r in results],
@@ -305,8 +322,14 @@ async def run_evals(
     interval: float = DEFAULT_INTERVAL_S,
     gold_only: bool = False,
     with_knowledge: bool = False,
+    until_quota: bool = False,
+    thinking_budget: int | None = None,
 ) -> None:
-    """Score the pipeline on the given datasets, spending at most today's eval budget."""
+    """Score the pipeline on the given datasets, spending at most today's eval budget
+    (`until_quota`: until Gemini refuses)."""
+    if thinking_budget is not None:
+        # Read when each request is built, so it changes the request and its cache key.
+        sql_generator.SQL_THINKING_BUDGET = thinking_budget
     try:
         targets = await _prepare(datasets, ids, core_only, reindex, with_knowledge)
         if gold_only:
@@ -314,7 +337,10 @@ async def run_evals(
             return
 
         ledger = QuotaLedger()
-        budget = ledger.remaining() if budget is None else min(budget, ledger.remaining())
+        if until_quota:
+            budget = sum(len(t.cases) for t in targets) * MAX_ATTEMPTS  # Gemini's refusals stop the run
+        else:
+            budget = ledger.remaining() if budget is None else min(budget, ledger.remaining())
         cache = GenerationCache()
         live_stream_sql = query_pipeline.stream_sql
         query_pipeline.stream_sql = cache.wrap(sql_generator.stream_sql, on_live_call=ledger.record_call)
@@ -360,7 +386,7 @@ async def _score(
             await asyncio.sleep(interval)
 
         result = await run_case(target, case, cached)
-        if not cached and result.error == errors.GENERATION_FAILED:
+        if not cached and is_refusal(result.error):
             # A refusal (usually quota) says nothing about accuracy: retry it next run.
             refusals += 1
             pending.append((target.dataset, case.id))
@@ -382,6 +408,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--core", action="store_true")
     parser.add_argument("--ids")
     parser.add_argument("--budget", type=int)
+    parser.add_argument("--until-quota", action="store_true", help="call Gemini until it refuses")
+    parser.add_argument("--thinking", type=int, help="Gemini thinking budget for this run")
     parser.add_argument("--check-gold", action="store_true")
     parser.add_argument("--reindex", action="store_true")
     parser.add_argument("--knowledge", action="store_true", help="seed each dataset's business definitions")
@@ -396,7 +424,7 @@ if __name__ == "__main__":
     args = parse_args()
     asyncio.run(
         run_evals(
-            args.datasets or sorted(SOURCES),
+            args.datasets or DAILY_DATASETS,
             budget=args.budget,
             ids=set(args.ids.split(",")) if args.ids else None,
             core_only=args.core,
@@ -404,5 +432,7 @@ if __name__ == "__main__":
             with_knowledge=args.knowledge,
             interval=args.interval,
             gold_only=args.check_gold,
+            until_quota=args.until_quota,
+            thinking_budget=args.thinking,
         )
     )

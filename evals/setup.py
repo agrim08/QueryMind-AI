@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.request
 
+from evals import distractors
 from evals.config import (
     APP_DATABASE,
     CONTAINER,
@@ -84,6 +85,22 @@ def _download(url: str) -> bytes:
 def load_dataset(source: Source) -> None:
     if _database_exists(source.database):
         logger.info("Database %s already loaded", source.database)
+        return
+    if source.template:
+        logger.info("Copying %s into %s", source.template, source.database)
+        _psql("postgres", f"CREATE DATABASE {source.database} TEMPLATE {source.template}")
+        if source.distractors:
+            logger.info("Adding %d look-alike tables to %s", distractors.table_count(), source.database)
+            try:
+                _docker(
+                    "exec", "-i", CONTAINER, "psql", "-U", "postgres", "-d", source.database, "-q", "-1",
+                    "-v", "ON_ERROR_STOP=1",
+                    stdin=distractors.ddl().encode(),
+                )
+            except RuntimeError:
+                # Otherwise the next setup would see the copy and skip it, distractors missing.
+                _psql("postgres", f"DROP DATABASE {source.database}")
+                raise
         return
     if not source.script_creates_database:
         _psql("postgres", f"CREATE DATABASE {source.database}")

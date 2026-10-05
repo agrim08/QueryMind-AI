@@ -3,6 +3,8 @@
 Yields raw text chunks as they arrive. The reply format (header lines, then SQL or another
 kind of answer) is defined and parsed in app.services.reply_format.
 """
+import hashlib
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -36,6 +38,7 @@ Rules you MUST follow:
 12. LINK TABLES: To connect two tables, follow the foreign keys shown in the schema, including through link tables (e.g. UserToProject between user and Project).
 13. OUTPUT COLUMNS: Return the columns the question asks for, preferring readable names over ids, with short readable aliases (e.g. AS "revenue", AS "month"). For rankings and breakdowns, return the label column first and the value being ranked by second. For trends, return the period first (date_trunc or EXTRACT), ordered by it.
 14. POSTGRES DETAILS: Use EXTRACT or date_trunc for years, months and other periods. Sort rankings with DESC NULLS LAST. Cast to numeric before dividing (100.0 * a / b) and ROUND averages and percentages to 2 decimals. Use COUNT(DISTINCT ...) when counting entities across joins.
+15. TIME RANGES: Work out relative periods from NOW(). "Over / in / during the last year", "the past year" and "the last 12 months" mean a rolling window ending now, not the previous calendar year; the same goes for days, weeks, months and quarters. Use a calendar period only when the question names one ("in 2025", "last calendar year", "this month"). For a per-month trend over a rolling window, start at the beginning of a month (date_trunc('month', NOW()) - INTERVAL '11 months' for twelve months) so the first month isn't partial. Whenever the question uses a relative period, add an Assumption saying the window in words (e.g. "the last 12 months, up to today") and offer the other reading as Instead.
 
 REPLY FORMAT. First these lines:
 -- Intent: <number | trend | ranking | breakdown | comparison | list | record | schema | other>
@@ -115,6 +118,20 @@ def build_request(
         thinking_config=genai_types.ThinkingConfig(thinking_budget=SQL_THINKING_BUDGET),
     )
     return _build_prompt(nl_query, table_docs, feedback, clarification, context), config
+
+
+def request_fingerprint(
+    nl_query: str,
+    table_docs: list[TableDoc],
+    feedback: RetryFeedback | None = None,
+    clarification: str | None = None,
+    context: PromptContext | None = None,
+) -> str:
+    """Hash of the exact Gemini request: model, prompt and config. The same fingerprint means
+    the model is asked exactly the same thing (answer_cache, and the eval answer cache)."""
+    contents, config = build_request(nl_query, table_docs, feedback, clarification, context)
+    payload = [GENERATION_MODEL, contents, config.model_dump(mode="json", exclude_none=True)]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 async def stream_sql(

@@ -123,5 +123,10 @@ class TestGenerationSettings:
         # Eval case c09: "top 5" was answered with LIMIT 500.
         assert "use exactly that LIMIT" in SYSTEM_PROMPT
 
+    def test_relative_periods_are_rolling_and_stated(self):
+        # "Per month over the last year" was answered for calendar 2025, with no Assumption.
+        assert "rolling window ending now, not the previous calendar year" in SYSTEM_PROMPT
+        assert "add an Assumption saying the window" in SYSTEM_PROMPT
+
     def test_no_schema_specific_hints(self):
         assert 'join with the "users" table' not in SYSTEM_PROMPT

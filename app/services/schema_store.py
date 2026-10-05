@@ -7,7 +7,7 @@ import re
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import case, delete, exists, func, insert, literal_column, select, union_all
+from sqlalchemy import case, delete, func, insert, literal_column, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import SchemaElement
@@ -73,13 +73,6 @@ async def replace_elements(
         )
 
 
-async def has_elements(session: AsyncSession, connection_id: uuid.UUID) -> bool:
-    """True once the connection has been indexed into pgvector."""
-    return bool(
-        await session.scalar(select(exists().where(SchemaElement.connection_id == connection_id)))
-    )
-
-
 def _tables(connection_id: uuid.UUID):
     return select(_DISPLAY_NAME.label("table_name"), SchemaElement.doc).where(
         SchemaElement.connection_id == connection_id, SchemaElement.kind == "table"
@@ -93,6 +86,33 @@ async def schema_size(session: AsyncSession, connection_id: uuid.UUID) -> int:
             SchemaElement.connection_id == connection_id, SchemaElement.kind == "table"
         )
     ) or 0
+
+
+async def tables_if_within(session: AsyncSession, connection_id: uuid.UUID, budget: int) -> list[TableDoc]:
+    """All table documents when together they fit `budget` characters, else none: the
+    full-schema check and the load in one round trip (most schemas are small)."""
+    total = (
+        select(func.coalesce(func.sum(func.length(SchemaElement.doc)), 0))
+        .where(SchemaElement.connection_id == connection_id, SchemaElement.kind == "table")
+        .scalar_subquery()
+    )
+    rows = await session.execute(_tables(connection_id).where(total <= budget).order_by(_DISPLAY_NAME))
+    return [TableDoc(table_name=r.table_name, doc=r.doc, score=1.0) for r in rows]
+
+
+def _regex_literal(text: str) -> str:
+    """`text` matched literally in a Postgres regular expression."""
+    return re.sub(r"(\W)", r"\\\1", text)
+
+
+async def tables_referencing(session: AsyncSession, connection_id: uuid.UUID, names: set[str]) -> list[TableDoc]:
+    """Tables with a foreign key to any of `names` (incoming links), other than those tables.
+    Matches the documents' "-> table(cols)" lines in the database, so only candidates travel."""
+    if not names:
+        return []
+    pattern = "-> (" + "|".join(_regex_literal(n) for n in sorted(names)) + r")\("
+    rows = await session.execute(_tables(connection_id).where(SchemaElement.doc.op("~")(pattern)))
+    return [TableDoc(table_name=r.table_name, doc=r.doc, score=0.0) for r in rows if r.table_name not in names]
 
 
 async def all_tables(session: AsyncSession, connection_id: uuid.UUID) -> list[TableDoc]:
@@ -133,6 +153,10 @@ async def search_tables(
 # in a table's document (column names, example values), and trigram similarity of table names
 # catches plurals and typos ("customers", "custmer" ~ customer).
 _RRF_K = 60
+# Marks a table document whose table is known to be empty (schema_indexer). An empty table
+# can't answer a question, so its search score is scaled down; it can still be shown.
+EMPTY_MARKER = "(empty)"
+EMPTY_TABLE_WEIGHT = 0.25
 _CANDIDATES_PER_RANKING = 30
 _NAME_SIMILARITY_MIN = 0.4
 _WORD = re.compile(r"[a-z0-9_]{3,}")
@@ -184,7 +208,10 @@ async def search_tables_hybrid(
     )
 
     ranked = union_all(*rankings).subquery()
-    score = func.sum(1.0 / (_RRF_K + ranked.c.rank)).label("score")
+    # The header is the document's first line; only there does the marker mean "empty".
+    header = func.split_part(SchemaElement.doc, "\n", 1)
+    weight = case((header.like(f"%{EMPTY_MARKER}"), EMPTY_TABLE_WEIGHT), else_=1.0)
+    score = (func.sum(1.0 / (_RRF_K + ranked.c.rank)) * weight).label("score")
     rows = await session.execute(
         select(_DISPLAY_NAME.label("table_name"), SchemaElement.doc, score)
         .join(ranked, ranked.c.id == SchemaElement.id)

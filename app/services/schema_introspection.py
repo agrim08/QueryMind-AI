@@ -9,7 +9,8 @@ most one bounded read per small table:
   by extensions, and individual partitions (their parent stands for them).
 - Columns with types, NOT NULL, primary keys, enum labels and the owner's comments.
 - Foreign keys, with schema-qualified targets outside `public`.
-- Approximate row counts from `pg_class.reltuples` (no COUNT(*) scans).
+- Approximate row counts from `pg_class.reltuples` (no COUNT(*) scans); a never-analysed
+  table with nothing on disk is known to be empty.
 - Example values only for low-variety text columns (status, country, category name...):
   from Postgres's own statistics (`pg_stats`) for analysed tables, or by reading at most
   SMALL_TABLE_ROWS rows of small tables, which autovacuum never analyses. Columns and tables
@@ -114,6 +115,8 @@ SELECT c.oid::bigint AS oid, n.nspname AS schema_name, c.relname AS name, c.relk
                 SELECT coalesce(sum(greatest(ch.reltuples, 0)), -1)
                 FROM pg_inherits i JOIN pg_class ch ON ch.oid = i.inhrelid
                 WHERE i.inhparent = c.oid)
+             -- Never analysed and nothing on disk: known to be empty (pg_relation_size reads no rows).
+             WHEN c.reltuples < 0 AND c.relkind IN ('r', 'm') AND pg_relation_size(c.oid) = 0 THEN 0
              ELSE c.reltuples END)::bigint AS row_estimate,
        obj_description(c.oid, 'pg_class') AS comment
 FROM pg_class c

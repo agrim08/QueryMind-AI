@@ -57,6 +57,10 @@ class TestTableDoc:
         table = TableInfo(schema="public", name="t", kind="r", row_estimate=-1, columns=[])
         assert build_table_doc(table).splitlines()[0] == "Table: t"
 
+    def test_an_empty_table_is_marked_so_search_ranks_it_lower(self):
+        table = TableInfo(schema="legacy", name="payment_archive", kind="r", row_estimate=0, columns=[])
+        assert build_table_doc(table).splitlines()[0] == "Table: legacy.payment_archive (empty)"
+
     def test_retriever_follows_schema_qualified_foreign_keys(self):
         doc = TableDoc("orders", "Table: orders\nForeign Keys:\n- (customer_id) -> sales.customers(id)", 1.0)
         assert referenced_tables([doc]) == {"sales.customers"}

@@ -16,7 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ai_config import FULL_SCHEMA_CHAR_BUDGET, RETRIEVAL_TOP_K_TABLES
 from app.services.embeddings import embed_query
-from app.services.schema_store import TableDoc, all_tables, schema_size, search_tables_hybrid, tables_by_name
+from app.services.schema_store import (
+    TableDoc,
+    search_tables_hybrid,
+    tables_by_name,
+    tables_if_within,
+    tables_referencing,
+)
 
 # Foreign-key lines in a table document: "- (customer_id) -> customers(id)"
 _FK_TARGET = re.compile(r"^- \(.*\) -> (.+)\(.*\)$", re.MULTILINE)
@@ -39,12 +45,32 @@ def within_budget(docs: list[TableDoc], budget: int = FULL_SCHEMA_CHAR_BUDGET) -
     return kept
 
 
+def bridge_tables(candidates: list[TableDoc], shown: set[str]) -> list[TableDoc]:
+    """Candidates that link two or more shown tables (e.g. invoice_line between invoice and
+    track, film_category between film and category): the join a question needs runs through
+    them, but their own names rarely match the question."""
+    return [d for d in candidates if len(set(_FK_TARGET.findall(d.doc)) & shown) >= 2]
+
+
 async def with_linked_tables(
-    session: AsyncSession, connection_id: uuid.UUID, ranked: list[TableDoc]
+    session: AsyncSession,
+    connection_id: uuid.UUID,
+    ranked: list[TableDoc],
+    hops: int = 1,
+    bridges: bool = False,
 ) -> list[TableDoc]:
-    """`ranked` plus the tables they reference by foreign key, trimmed to the budget."""
-    linked = await tables_by_name(session, connection_id, referenced_tables(ranked))
-    return within_budget(ranked + linked)
+    """`ranked`, then (with `bridges`) tables linking two of them, then the tables all of those
+    reference by foreign key, `hops` levels deep; trimmed to the budget in that order."""
+    docs = list(ranked)
+    if bridges:
+        shown = {d.table_name for d in docs}
+        docs += bridge_tables(await tables_referencing(session, connection_id, shown), shown)
+    for _ in range(hops):
+        linked = await tables_by_name(session, connection_id, referenced_tables(docs))
+        if not linked:
+            break
+        docs += linked
+    return within_budget(docs)
 
 
 async def retrieve_schema(
@@ -53,10 +79,15 @@ async def retrieve_schema(
     nl_query: str,
 ) -> list[TableDoc]:
     """The table documents to put in the prompt for this question."""
-    if await schema_size(session, connection_id) <= FULL_SCHEMA_CHAR_BUDGET:
-        return await all_tables(session, connection_id)
+    if whole := await tables_if_within(session, connection_id, FULL_SCHEMA_CHAR_BUDGET):
+        return whole
+    return await search_schema(session, connection_id, nl_query, await embed_query(nl_query))
 
-    ranked = await search_tables_hybrid(
-        session, connection_id, nl_query, await embed_query(nl_query), RETRIEVAL_TOP_K_TABLES
-    )
+
+async def search_schema(
+    session: AsyncSession, connection_id: uuid.UUID, nl_query: str, query_vector: list[float]
+) -> list[TableDoc]:
+    """The large-schema path: hybrid search, then the tables those link to (evals.retrieval
+    measures exactly this)."""
+    ranked = await search_tables_hybrid(session, connection_id, nl_query, query_vector, RETRIEVAL_TOP_K_TABLES)
     return await with_linked_tables(session, connection_id, ranked)

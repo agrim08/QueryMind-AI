@@ -10,6 +10,7 @@ and store the vectors in pgvector (schema_elements).
 A connection is marked indexed only after every table has been embedded and the new
 rows have replaced the old ones in a single transaction.
 """
+import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -18,13 +19,13 @@ from datetime import timedelta
 from sqlalchemy import func, or_, update
 
 from app.core import errors
-from app.core.ai_config import EMBED_BATCH_SIZE, MAX_INDEXED_TABLES
+from app.core.ai_config import EMBED_BATCH_SIZE, EMBED_RATE_LIMIT_WAIT_S, MAX_INDEXED_TABLES
 from app.core.exceptions import InvalidInput
 from app.db.session import AsyncSessionLocal
 from app.models.models import DBConnection
 from app.services.embeddings import embed_texts
 from app.services.schema_introspection import TableInfo, introspect
-from app.services.schema_store import NewElement, replace_elements
+from app.services.schema_store import EMPTY_MARKER, NewElement, replace_elements
 from app.services.target_db import decrypt_url
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,9 @@ def build_table_doc(table: TableInfo) -> str:
     form `- (cols) -> table(cols)`, which schema_retriever parses for FK expansion.
     """
     header = f"{_VIEW_KINDS.get(table.kind, 'Table')}: {table.display_name}"
-    if table.row_estimate >= 0 and table.kind in ("r", "p", "m"):
+    if table.row_estimate == 0 and table.kind in ("r", "p", "m"):
+        header += f" {EMPTY_MARKER}"  # search ranks empty tables lower (schema_store)
+    elif table.row_estimate > 0 and table.kind in ("r", "p", "m"):
         header += f" (~{table.row_estimate:,} rows)"
     lines = [header]
     if table.comment:
@@ -71,6 +74,26 @@ def build_table_doc(table: TableInfo) -> str:
                 f"- ({', '.join(fk.columns)}) -> {fk.referred_table}({', '.join(fk.referred_columns)})"
             )
     return "\n".join(lines)
+
+
+async def embed_documents(docs: list[str], vectors: list[list[float]]) -> AsyncIterator[dict]:
+    """Embed `docs` in batches, appending to `vectors` and yielding progress events.
+
+    Embeddings are rate-limited per minute (tightly on the free tier), and a schema of a few
+    hundred tables needs several batches. A refused batch waits for the next minute and is
+    tried once more; indexing runs in the background, so waiting beats failing the whole run.
+    """
+    for start in range(0, len(docs), EMBED_BATCH_SIZE):
+        batch = docs[start : start + EMBED_BATCH_SIZE]
+        try:
+            vectors += await embed_texts(batch, "RETRIEVAL_DOCUMENT")
+        except Exception as exc:
+            if not errors.is_ai_rate_limited(exc):
+                raise
+            yield {"type": "status", "message": "Large schema: waiting a minute for the AI service's rate limit..."}
+            await asyncio.sleep(EMBED_RATE_LIMIT_WAIT_S)
+            vectors += await embed_texts(batch, "RETRIEVAL_DOCUMENT")
+        yield {"type": "progress", "current": len(vectors), "total": len(docs)}
 
 
 async def _claim(connection_id: uuid.UUID) -> bool:
@@ -133,9 +156,8 @@ async def index_connection(
         yield {"type": "status", "message": f"{found}. Building embeddings..."}
         docs = [build_table_doc(t) for t in tables]
         vectors: list[list[float]] = []
-        for start in range(0, total, EMBED_BATCH_SIZE):
-            vectors += await embed_texts(docs[start : start + EMBED_BATCH_SIZE], "RETRIEVAL_DOCUMENT")
-            yield {"type": "progress", "current": len(vectors), "total": total}
+        async for event in embed_documents(docs, vectors):
+            yield event
 
         yield {"type": "status", "message": "Updating search index..."}
         elements = [

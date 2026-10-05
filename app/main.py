@@ -2,6 +2,7 @@
 import logging
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,16 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+if settings.SENTRY_DSN:
+    # send_default_pii=False: request bodies/headers can carry connection strings
+    # and user data that must never leave the backend (security.md #4, #6).
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=settings.ENVIRONMENT,
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
 
 
 @asynccontextmanager

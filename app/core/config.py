@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     CLERK_ISSUER: str = ""
     CLERK_JWKS_URL: str = ""
 
+    # Sentry (error monitoring) — empty disables it
+    SENTRY_DSN: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True,

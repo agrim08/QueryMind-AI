@@ -4,10 +4,11 @@ from datetime import date, datetime, timezone
 
 import pytest
 
+from app.core import errors
 from app.services.schema_store import TableDoc
 from evals import generation_cache
 from evals.generation_cache import GenerationCache, request_key
-from evals.quota import quota_day
+from evals.quota import is_refusal, quota_day
 
 DOCS = [TableDoc("artist", "Table: artist\nColumns:\n- name (VARCHAR)", 0.0)]
 
@@ -85,3 +86,12 @@ class TestGenerationCache:
         _collect(stream_sql("q", DOCS))
         _collect(stream_sql("q", DOCS))
         assert recorded == [1]
+
+
+class TestRefusals:
+    def test_a_rate_limited_question_is_retried_not_scored(self):
+        # p30 on 2026-10-05: Gemini's 429 reached the eval as AI_BUSY and was scored as a failure.
+        assert is_refusal(errors.AI_BUSY)
+        assert is_refusal(errors.GENERATION_FAILED)
+        assert not is_refusal(None)
+        assert not is_refusal(errors.WRITE_REQUEST)

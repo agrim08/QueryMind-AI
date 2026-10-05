@@ -78,6 +78,8 @@ def test_fenced_reply_with_assumption_runs_only_the_statement(monkeypatch):
     assert [e["type"] for e in events][-2:] == ["results", "done"]
     # History keeps what the model wrote, including its stated assumption.
     assert "Assumption: sales means invoice totals" in outcome.generated_sql
+    # The saved answer is the presentation the browser got.
+    assert outcome.answer == events[-2]["answer"]
 
 
 def test_cannot_answer_is_a_friendly_metered_decline(monkeypatch):
@@ -260,3 +262,66 @@ class TestBusinessContext:
         results = next(e for e in events if e["type"] == "results")
         assert results["verified_match"] == "total revenue"
         assert results["knowledge_used"] == ["revenue"]
+
+
+class TestReusingEarlierAnswers:
+    """answer_cache: the same request reuses the earlier reply; the SQL is still validated and run."""
+
+    def _earlier(self, monkeypatch, reply: str | None) -> list[tuple]:
+        lookups: list[tuple] = []
+
+        async def earlier_reply(session, user_id, connection_id, fingerprint):
+            lookups.append((user_id, fingerprint))
+            return reply
+
+        monkeypatch.setattr(query_pipeline.answer_cache, "earlier_reply", earlier_reply)
+        return lookups
+
+    def _run(self, h: Harness, user_id: uuid.UUID | None) -> tuple[list[dict], PipelineOutcome]:
+        outcome = PipelineOutcome()
+
+        async def collect() -> list[dict]:
+            return [
+                e async for e in run_pipeline(None, uuid.uuid4(), "x", "total sales?", outcome, reuse_for_user=user_id)
+            ]
+
+        return asyncio.run(collect()), outcome
+
+    def test_the_same_request_reuses_the_reply_without_calling_gemini(self, monkeypatch):
+        lookups = self._earlier(monkeypatch, '-- Intent: number\nSELECT SUM("total") FROM "invoice"')
+        h = Harness(monkeypatch, [])  # no scripted Gemini reply: a call would fail
+        user = uuid.uuid4()
+        events, outcome = self._run(h, user)
+
+        assert h.prompts == []
+        assert h.executed == ['SELECT SUM("total") FROM "invoice"']  # still run live
+        assert outcome.reused is True and outcome.status == "success"
+        assert events[-2]["type"] == "results" and events[-2]["reused"] is True
+        assert lookups == [(user, outcome.prompt_hash)]
+
+    def test_no_user_means_no_reuse(self, monkeypatch):
+        lookups = self._earlier(monkeypatch, 'SELECT SUM("total") FROM "invoice"')
+        h = Harness(monkeypatch, ['SELECT SUM("total") FROM "invoice"'])
+        events, outcome = self._run(h, None)
+
+        assert lookups == [] and len(h.prompts) == 1
+        assert outcome.reused is False and events[-2]["reused"] is False
+        assert outcome.prompt_hash  # recorded, so a later question can reuse this one
+
+    def test_a_reused_reply_that_no_longer_runs_is_fixed_by_the_model(self, monkeypatch):
+        self._earlier(monkeypatch, 'SELECT "gone" FROM "invoice"')
+        missing = _db_error(pg_errors.UndefinedColumnError('column "gone" does not exist'))
+        h = Harness(monkeypatch, ['SELECT SUM("total") FROM "invoice"'], [missing, RESULT])
+        events, outcome = self._run(h, uuid.uuid4())
+
+        assert len(h.prompts) == 1 and h.prompts[0][1] is not None  # one retry, with the error
+        assert outcome.reused is False and outcome.status == "success"
+
+
+def test_every_step_is_timed_in_order(monkeypatch):
+    h = Harness(monkeypatch, ['SELECT SUM("total") FROM "invoice"'])
+    _, outcome = h.run()
+    milestones = ["retrieved", "first_sql", "generated", "validated", "executed", "total"]
+    assert list(outcome.timings) == milestones
+    values = [outcome.timings[m] for m in milestones]
+    assert values == sorted(values)  # each milestone is at or after the previous one

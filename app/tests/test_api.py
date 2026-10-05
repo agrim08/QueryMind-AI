@@ -64,10 +64,13 @@ def question_steps(monkeypatch):
     async def get_for_user(session, user_id, connection_id):
         if not calls["owned"]:
             raise NotFound(errors.CONNECTION_NOT_FOUND)
-        return SimpleNamespace(id=connection_id, encrypted_conn_string="x")
-
-    async def has_elements(session, connection_id):
-        return calls["indexed"]
+        indexed = calls["indexed"]
+        return SimpleNamespace(
+            id=connection_id,
+            encrypted_conn_string="x",
+            indexed_at="2026-10-05T00:00:00Z" if indexed else None,
+            table_count=10 if indexed else None,
+        )
 
     async def reserve(session, user_id, connection_id, question, monthly_limit, follow_up_of=None):
         calls["reserved"] = True
@@ -89,13 +92,15 @@ def question_steps(monkeypatch):
     async def load_context(session, user_id, connection_id, question, follow_up_of):
         return QuestionContext()
 
-    async def run_pipeline(session, connection_id, url, question, outcome, clarification=None, context=None):
+    async def run_pipeline(
+        session, connection_id, url, question, outcome, clarification=None, context=None, reuse_for_user=None
+    ):
         calls["pipeline"] = (question, clarification)
+        calls["reuse_for_user"] = reuse_for_user
         yield {"type": "results", "rows": []}
         yield {"type": "done"}
 
     monkeypatch.setattr(query_endpoint.connection_service, "get_for_user", get_for_user)
-    monkeypatch.setattr(query_endpoint, "has_elements", has_elements)
     monkeypatch.setattr(query_endpoint.query_meter, "resume", resume)
     monkeypatch.setattr(query_endpoint.knowledge, "remember_clarification", remember_clarification)
     monkeypatch.setattr(query_endpoint.question_context, "load", load_context)
@@ -115,6 +120,14 @@ class TestQuestionGate:
 
     def test_unindexed_connection_is_400_and_not_counted(self, client, question_steps):
         question_steps["indexed"] = False
+        assert client.post("/api/v1/query/", json=QUESTION).status_code == 400
+        assert question_steps["reserved"] is False
+
+    def test_an_indexed_connection_with_no_tables_is_400_and_not_counted(self, client, question_steps, monkeypatch):
+        async def get_for_user(session, user_id, connection_id):
+            return SimpleNamespace(id=connection_id, encrypted_conn_string="x", indexed_at="2026-10-05", table_count=0)
+
+        monkeypatch.setattr(query_endpoint.connection_service, "get_for_user", get_for_user)
         assert client.post("/api/v1/query/", json=QUESTION).status_code == 400
         assert question_steps["reserved"] is False
 
@@ -149,6 +162,15 @@ class TestQuestionGate:
         response = client.post("/api/v1/query/", json={**QUESTION, "follow_up_of": earlier})
         assert response.status_code == 200
         assert str(question_steps["follow_up_of"]) == earlier
+
+    def test_earlier_answers_are_reused_only_from_the_same_user(self, client, question_steps):
+        assert client.post("/api/v1/query/", json=QUESTION).status_code == 200
+        assert question_steps["reuse_for_user"] == USER.id
+
+    def test_fresh_asks_the_model_again(self, client, question_steps):
+        assert client.post("/api/v1/query/", json={**QUESTION, "fresh": True}).status_code == 200
+        assert question_steps["reuse_for_user"] is None
+        assert question_steps["reserved"] is True  # a new query still counts
 
     def test_expired_clarification_is_404(self, client, question_steps):
         question_steps["resume_error"] = NotFound(errors.CLARIFICATION_EXPIRED)
@@ -195,6 +217,88 @@ class TestValidation:
         response = client.post("/api/v1/connections/test", json={"conn_string": "http://169.254.169.254/"})
         assert response.status_code == 200
         assert response.json()["ok"] is False
+
+
+class _HistoryDb:
+    """Answers the history endpoint's count and page queries."""
+
+    def __init__(self, logs):
+        self.logs = logs
+
+    async def scalar(self, statement):
+        return len(self.logs)
+
+    async def scalars(self, statement):
+        return iter(self.logs)
+
+
+def test_history_items_say_whether_their_answer_is_verified(client, monkeypatch):
+    def log(question):
+        return SimpleNamespace(
+            id=uuid.uuid4(), connection_id=uuid.uuid4(), nl_query=question, generated_sql="SELECT 1",
+            row_count=1, exec_time_ms=5, status="success", error_message=None, follow_up_of=None,
+            created_at="2026-10-05T00:00:00Z",
+        )
+
+    verified, plain = log("total sales?"), log("top artists?")
+    db = _HistoryDb([verified, plain])
+    app.dependency_overrides[get_db] = lambda: db
+
+    async def verified_log_ids(session, user_id, logs):
+        assert session is db and user_id == USER.id
+        return {verified.id}
+
+    monkeypatch.setattr(query_endpoint.verified_queries, "verified_log_ids", verified_log_ids)
+    response = client.get("/api/v1/query/history")
+
+    assert response.status_code == 200
+    assert [item["verified"] for item in response.json()["items"]] == [True, False]
+
+
+def test_history_items_carry_the_restatement_and_the_bare_statement(client, monkeypatch):
+    entry = SimpleNamespace(
+        id=uuid.uuid4(), connection_id=uuid.uuid4(), nl_query="total sales?",
+        generated_sql="-- Intent: number\n-- Understood: Total of all sales.\nSELECT 1\n-- Follow-up: By month?",
+        row_count=1, exec_time_ms=5, status="success", error_message=None, follow_up_of=None,
+        created_at="2026-10-05T00:00:00Z",
+    )
+    app.dependency_overrides[get_db] = lambda: _HistoryDb([entry])
+
+    async def verified_log_ids(session, user_id, logs):
+        return set()
+
+    monkeypatch.setattr(query_endpoint.verified_queries, "verified_log_ids", verified_log_ids)
+    item = client.get("/api/v1/query/history").json()["items"][0]
+
+    assert item["understood"] == "Total of all sales."
+    assert item["sql"] == "SELECT 1"
+    assert item["generated_sql"] == entry.generated_sql  # the full reply is still there for exports
+
+
+class TestSavedAnswer:
+    def test_returns_the_users_saved_answer(self, client, monkeypatch):
+        question_id = uuid.uuid4()
+        saved = {"answer": {"headline": "4 projects."}, "columns": ["count"], "rows": [[4]], "row_count": 1, "truncated": False}
+
+        async def get(session, user_id, log_id):
+            assert user_id == USER.id and log_id == question_id  # scoped to the signed-in user
+            return saved
+
+        monkeypatch.setattr(query_endpoint.answer_snapshot, "get", get)
+        response = client.get(f"/api/v1/query/{question_id}/answer")
+
+        assert response.status_code == 200
+        assert response.json() == saved
+
+    def test_a_question_without_a_saved_answer_is_404_with_next_steps(self, client, monkeypatch):
+        async def get(session, user_id, log_id):
+            raise NotFound(errors.ANSWER_NOT_SAVED)
+
+        monkeypatch.setattr(query_endpoint.answer_snapshot, "get", get)
+        response = client.get(f"/api/v1/query/{uuid.uuid4()}/answer")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == errors.ANSWER_NOT_SAVED
 
 
 def test_requests_without_a_token_are_rejected():

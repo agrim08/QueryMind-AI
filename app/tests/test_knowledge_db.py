@@ -12,7 +12,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.models import DBConnection, KnowledgeItem, QueryLog, User
-from app.services import knowledge, query_meter, verified_queries
+from app.services import answer_cache, knowledge, query_meter, verified_queries
 from app.services.knowledge import ItemDraft
 from app.services.question_context import previous_turns
 
@@ -72,6 +72,22 @@ def test_verified_answers_are_found_for_rephrased_questions():
     assert unrelated == []
 
 
+def test_history_marks_only_the_answer_that_was_verified():
+    async def scenario(s, user_id, connection_id):
+        older = await _answered(s, user_id, connection_id, "total revenue", 'SELECT 1 FROM "invoice"')
+        newer = await _answered(s, user_id, connection_id, "total revenue", 'SELECT 2 FROM "invoice"')
+        other = await _answered(s, user_id, connection_id, "list artists", 'SELECT 3 FROM "artist"')
+        await verified_queries.verify(s, user_id, newer)  # the user verifies the newer answer
+        logs = list(await s.scalars(select(QueryLog).where(QueryLog.user_id == user_id)))
+        mine = await verified_queries.verified_log_ids(s, user_id, logs)
+        someone_else = await verified_queries.verified_log_ids(s, uuid.uuid4(), logs)
+        return mine, someone_else, {"older": older, "newer": newer, "other": other}
+
+    mine, someone_else, ids = _run(scenario)
+    assert mine == {ids["newer"]}  # same question, different SQL: not verified
+    assert someone_else == set()  # scoped by user
+
+
 def test_conversation_carries_the_last_two_questions_oldest_first():
     async def scenario(s, user_id, connection_id):
         first = await _answered(s, user_id, connection_id, "revenue by month", "SELECT 1")
@@ -124,3 +140,22 @@ def test_a_clarification_answer_is_remembered():
     assert (item.kind, item.name, item.definition) == (
         "clarification", "who are our best customers?", "Best by what? → By total spent"
     )
+
+
+def test_earlier_answers_are_reused_newest_first_and_only_the_users_own():
+    async def scenario(s, user_id, connection_id):
+        for sql, status in [("SELECT 1", "success"), ("SELECT 2", "success"), ("SELECT 3", "error")]:
+            s.add(QueryLog(
+                user_id=user_id, connection_id=connection_id, nl_query="total sales?",
+                generated_sql=sql, status=status, prompt_hash="h1",
+            ))
+            await s.commit()  # separate transactions, so created_at increases
+        return (
+            await answer_cache.earlier_reply(s, user_id, connection_id, "h1"),
+            await answer_cache.earlier_reply(s, uuid.uuid4(), connection_id, "h1"),
+            await answer_cache.earlier_reply(s, user_id, connection_id, "other"),
+        )
+
+    newest, someone_else, different_request = _run(scenario)
+    assert newest == "SELECT 2"  # the newest *successful* reply
+    assert someone_else is None and different_request is None

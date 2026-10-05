@@ -59,7 +59,15 @@ python -m evals.run pagila --ids p03,p16    # selected cases
 python -m evals.run --budget 3              # at most 3 new Gemini calls
 python -m evals.run pagila --reindex        # rebuild the schema index first
 python -m evals.run --knowledge             # with each dataset's business definitions
+python -m evals.run --core --thinking 0     # Gemini thinking off (compare with the default 1024)
+python -m evals.run --until-quota           # catch-up run: spend the whole quota left today
+python -m evals.run chinook_xl pagila_xl    # the large-schema variants (not in the daily run)
 ```
+
+`--until-quota` ignores the 15-call eval budget and calls Gemini until it refuses, so it also uses
+the app's share of the day: use it only when you won't need the app until the quota resets.
+A refusal (HTTP 429, shown in the app as "QueryMind is busy") is never scored: the question stays
+pending for the next run.
 
 Each run writes `reports/<timestamp>.json` (every generated query) and `reports/latest.md`
 (the readable summary). Both are git-ignored. Calls are spaced 7 seconds apart for the
@@ -67,18 +75,24 @@ per-minute limit, and a run stops calling Gemini after two refusals in a row.
 
 ## Retrieval eval
 
-`python -m evals.retrieval` forces the large-schema search path (the eval databases are small enough
-to be sent whole in the app) and checks whether every table the gold SQL reads is shown to the model.
-Embedding calls only. Results on 2026-10-04 (top 6 tables):
+`python -m evals.retrieval [--reindex]` checks, for every question, whether all the tables the gold
+SQL reads are shown to the model. The base datasets force the search path (the app sends them
+whole); the `_xl` variants are large enough that the app searches. Question embeddings are cached
+(`.cache/embeddings.json`), so comparing retrieval changes costs no API calls.
 
-| Dataset | Vector only | Vector + FK links | Hybrid + FK links |
-|---|---|---|---|
-| chinook | 31/33 (94%) | 31/33 (94%) | 31/33 (94%) |
-| pagila | 21/31 (68%) | 27/31 (87%) | 27/31 (87%) |
+Phase 4.2 results (2026-10-06), share of questions with every needed table shown:
 
-Foreign-key expansion is the big win. Hybrid search ties on whole questions but misses fewer tables
-inside the failing ones. The remaining misses are 4–5-table join chains (film → inventory → rental →
-payment); two-hop FK expansion is the likely next step.
+| Strategy | chinook | chinook_xl | pagila | pagila_xl | Avg schema chars |
+|---|---|---|---|---|---|
+| top 6 + FK links (Phase 1.4), decoys not marked | 94% | 73% | 87% | 68% | ~2,400 |
+| top 6 + FK links, empty tables ranked lower | 94% | 91% | 87% | 87% | ~2,500 |
+| **top 12 + FK links (the app since 4.2)** | **100%** | **97%** | **100%** | **100%** | ~4,000 |
+| top 12 + bridge tables + 2 FK hops | 100% | 97% | 100% | 100% | ~4,600 |
+
+Empty tables (detected at indexing) are ranked lower: an empty table can't answer anything. The
+decoys here are all empty, so that step flatters the `_xl` scores; with non-empty look-alikes
+(analytics marts) business definitions are what point at the right table. The remaining miss
+(c35) needs a three-table chain.
 
 ## Business definitions
 
@@ -109,9 +123,16 @@ depends on ties at a `LIMIT` cut-off, and run `--check-gold` after editing.
 |---|---|---|---|
 | chinook | music store | 11 tables | small, clean names |
 | pagila | DVD rental | 22 tables (7 partitions) + 7 views | UPPER CASE data, partitions, enum and array columns |
+| chinook_xl | chinook + 180 look-alike tables | 191 relations | large-schema variant (Phase 4.2), same questions |
+| pagila_xl | pagila + 180 look-alike tables | 203 relations | large-schema variant (Phase 4.2), same questions |
 
-AdventureWorks (~70 tables across several schemas) is added with Phase 1.3, once the
-indexer reads schemas other than `public`.
+The `_xl` variants are copies of the base databases plus ~180 empty tables in 12 schemas
+(`evals/distractors.py`): CRM, finance, HR, analytics marts, legacy archives… many deliberately
+named like the real ones (`crm.customer`, `finance.invoice`, `legacy.payment_archive`). They're
+beyond the size the app sends whole, so retrieval has to pick the right tables among decoys.
+The decoys are empty, which the indexer detects; real company databases would also have
+non-empty look-alikes (analytics marts), where business definitions decide which table is meant.
+
 
 ## Results
 
@@ -119,6 +140,7 @@ indexer reads schemas other than `public`.
 |---|---|---|---|---|
 | 2026-10-04 | Baseline (partial: Gemini free tier allows 20 requests/day) | 8/11 (c01–c11) | not run | 2.2 s |
 | 2026-10-04 | Validator ignores `FROM` inside `EXTRACT(…)` and similar (re-scored from cache) | 9/11 (c01–c11) | not run | — |
+| 2026-10-05 | Core set; prompt: rolling time windows, LIMIT rule (1 Gemini refusal left pending) | 7/8 core | 4/6 core | 2.8 s |
 
 Baseline failures: c05 typo in a name (`ILIKE '%zepelin%'`), c08 valid `EXTRACT(YEAR FROM …)`
 rejected by the validator's table check (fixed), c09 "top 5" answered with `LIMIT 500`.

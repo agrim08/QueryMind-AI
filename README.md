@@ -196,6 +196,7 @@ All routes are under `/api/v1` and require a Clerk JWT.
 | `POST /query/` | Ask a question (SSE: `status`, `sql_chunk`, `retry`, `results`, `clarify`, `message`, `done`, `error`); send `clarification: {question_id, answer}` to answer a `clarify` |
 | `GET /query/history` | Past questions: `{items, total}` |
 | `POST /query/{question_id}/verify` | 👍: save an answered question and its SQL as verified |
+| `GET /query/{question_id}/answer` | The answer saved when it was asked (headline, chart, first 50 rows), for History |
 | `GET /connections/{id}/knowledge` | Business description, definitions, verified answers, starter questions |
 | `PUT …/knowledge/description` · `POST …/knowledge/draft` · `POST …/knowledge/extract` | Save the description; AI draft from the schema; extract definitions and starter questions |
 | `POST …/knowledge/items` · `PATCH`/`DELETE …/knowledge/items/{item_id}` · `DELETE …/knowledge/verified/{id}` | Manage definitions and verified answers |
@@ -241,11 +242,24 @@ pytest -q app/tests
 ```
 
 Unit tests mock Gemini and the target database. Opt-in tests run against a real Postgres when
-`QM_TEST_TARGET_DATABASE_URL` (any database) or `QM_TEST_PAGILA_URL` (the eval Pagila database) is set.
+`QM_TEST_TARGET_DATABASE_URL` (any database), `QM_TEST_PAGILA_URL` (the eval Pagila database) or
+`QM_TEST_APP_DATABASE_URL` (a migrated non-production app database, e.g. the eval one) is set.
+
+### Latency
+
+```bash
+python -m scripts.latency_report 7   # p50 / p95 per step over the last 7 days (read-only)
+```
+
+Every question stores its step timings (`query_logs.timings`). Most of the time before Gemini
+starts is round trips to the app database, so run the API in the same region as Neon.
 
 ## Known limitations
 
 - Gemini's free tier allows 20 SQL generations a day for the whole app; a real launch needs a paid key.
+  Repeated questions reuse their earlier SQL (no new call), which stretches it.
+- Embeddings are limited to 100 texts a minute on the free tier, so indexing a schema of a few
+  hundred tables takes a few minutes (the indexer waits instead of failing).
 - Rate limits are kept in memory per process; running several workers needs a shared store (Redis).
 - The validator's table check is text-based: in a comma join (`FROM a, b`) only the first table is
   checked. It guards against invented tables; the read-only transaction is the safety boundary.

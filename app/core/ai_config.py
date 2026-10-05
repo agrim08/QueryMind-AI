@@ -23,6 +23,9 @@ SETUP_MAX_OUTPUT_TOKENS = 4096
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 768  # Matryoshka-truncated; stored as halfvec(768)
 EMBED_BATCH_SIZE = 100  # max texts per embedding request
+# Indexing: a rate-limited embedding batch waits this long (the per-minute window) and is
+# retried once. Questions never wait: their one embedding call fails fast instead.
+EMBED_RATE_LIMIT_WAIT_S = 60
 # Tables and views indexed per connection (public schema and tables before views, largest
 # first). Bounds embedding calls and storage for very wide databases.
 MAX_INDEXED_TABLES = 1000
@@ -31,5 +34,8 @@ MAX_INDEXED_TABLES = 1000
 # Schemas whose table documents fit this budget go to the model whole: no embedding call,
 # no vector search, and no table can be missed. ~4 characters per token → ~12k tokens.
 FULL_SCHEMA_CHAR_BUDGET = 48_000
-# Larger schemas: the closest tables by vector search, then the tables they reference.
-RETRIEVAL_TOP_K_TABLES = 6
+# Larger schemas: the best tables by hybrid search, then the tables they reference. 12, not 6
+# (2026-10-06, evals.retrieval on ~200-table schemas): 91% → 97% and 87% → 100% of questions
+# get every table they need, for ~1,500 more schema characters; bridges and a second
+# foreign-key hop added nothing on top.
+RETRIEVAL_TOP_K_TABLES = 12

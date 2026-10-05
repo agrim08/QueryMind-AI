@@ -78,6 +78,7 @@ KNOWLEDGE_FULL = "This connection has the maximum number of definitions. Remove 
 KNOWLEDGE_NOT_FOUND = "That definition no longer exists."
 VERIFY_NOT_POSSIBLE = "Only answered questions can be saved as verified."
 VERIFIED_FULL = "This connection has the maximum number of verified answers. Remove some you no longer need."
+ANSWER_NOT_SAVED = "There's no saved answer for this question. Use Ask again to see it with today's data."
 QUESTION_IN_FLIGHT = "You already have a question running. Wait for it to finish, then ask again."
 QUESTION_STOPPED = "Stopped before finishing."
 TOO_MANY_REQUESTS = "You're going a little fast. Please wait a minute and try again."

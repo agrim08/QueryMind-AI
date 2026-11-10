@@ -54,13 +54,49 @@ class Entitlements:
     pdf_export: bool
 
 
-def _build_entitlements(payload: dict) -> Entitlements:
-    """Parse Clerk JWT features array into a typed Entitlements object."""
-    raw_fea = payload.get("fea") or []
-    features: frozenset = frozenset(raw_fea)
+def _normalize_feature_set(raw_fea: Any) -> frozenset[str]:
+    """Extract and normalize feature names, stripping Clerk Billing scope prefixes (u:, o:)."""
+    if isinstance(raw_fea, str):
+        raw_fea = [raw_fea]
+    if not isinstance(raw_fea, (list, tuple, set, frozenset)):
+        return frozenset()
+    normalized: set[str] = set()
+    for item in raw_fea:
+        if not isinstance(item, str):
+            continue
+        s = item.strip()
+        normalized.add(s)
+        # Clerk Billing encodes features like 'u:pro_tier' (user) or 'o:pro_tier' (org)
+        if ":" in s:
+            normalized.add(s.split(":", 1)[1])
+        if s.startswith("u:") or s.startswith("o:"):
+            normalized.add(s[2:])
+    return frozenset(normalized)
 
-    is_team = "team_tier" in features
-    is_pro = is_team or "pro_tier" in features
+
+def _build_entitlements(payload: dict) -> Entitlements:
+    """Parse Clerk JWT features, plan claims, and metadata into a typed Entitlements object."""
+    raw_fea = payload.get("fea") or payload.get("features") or []
+    features: frozenset = _normalize_feature_set(raw_fea)
+
+    # Check plan claims (Clerk Billing 'pla', e.g. 'u:pro', 'o:team', or bare 'pro')
+    plan_slug = ""
+    for key in ("pla", "plan", "tier"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            plan_slug = val.strip().split(":")[-1].lower()
+            break
+
+    # Also check public metadata if present
+    if not plan_slug:
+        pub_meta = payload.get("public_metadata") or payload.get("publicMetadata") or {}
+        if isinstance(pub_meta, dict):
+            val = pub_meta.get("plan") or pub_meta.get("tier")
+            if isinstance(val, str):
+                plan_slug = val.strip().split(":")[-1].lower()
+
+    is_team = "team_tier" in features or plan_slug in ("team", "team_tier")
+    is_pro = is_team or "pro_tier" in features or plan_slug in ("pro", "pro_tier")
 
     if is_team:
         max_connections = UNLIMITED

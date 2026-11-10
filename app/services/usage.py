@@ -19,14 +19,15 @@ def month_start_utc(now: datetime | None = None) -> datetime:
 
 def questions_this_month(user_id: uuid.UUID) -> ScalarSelect[int]:
     """The user's question count this month, as a subquery (query_meter combines it with
-    other checks in one round trip). Excludes failed questions so users are not billed
-    for generation errors or system failures."""
+    other checks in one round trip). Counts completed questions (success, clarify,
+    validation_error). Excludes failed questions (error) and in-flight/crashed ones (pending)
+    so users are never billed for system failures or transient states."""
     return (
         select(func.count(QueryLog.id))
         .where(
             QueryLog.user_id == user_id,
             QueryLog.created_at >= month_start_utc(),
-            QueryLog.status != "error",
+            QueryLog.status.in_(["success", "clarify", "validation_error"]),
         )
         .scalar_subquery()
     )

@@ -19,8 +19,13 @@ class TestEntitlements:
         [
             ([], 1, 50, 1, False, False),
             (["pro_tier"], 5, UNLIMITED, 6, True, False),
+            (["u:pro_tier"], 5, UNLIMITED, 6, True, False),
+            (["o:pro_tier"], 5, UNLIMITED, 6, True, False),
             (["team_tier"], UNLIMITED, UNLIMITED, UNLIMITED, True, True),
+            (["u:team_tier"], UNLIMITED, UNLIMITED, UNLIMITED, True, True),
+            (["o:team_tier"], UNLIMITED, UNLIMITED, UNLIMITED, True, True),
             (["csv_export"], 1, 50, 1, True, False),
+            (["u:csv_export"], 1, 50, 1, True, False),
         ],
     )
     def test_plan_matrix(self, fea, connections, queries, designs, csv, pdf):
@@ -30,3 +35,20 @@ class TestEntitlements:
 
     def test_team_implies_pro(self):
         assert _build_entitlements({"fea": ["team_tier"]}).is_pro
+        assert _build_entitlements({"fea": ["u:team_tier"]}).is_pro
+
+    def test_clerk_plan_claim(self):
+        # Clerk Billing passes 'pla': 'u:pro' or 'o:team'
+        plan_pro = _build_entitlements({"pla": "u:pro"})
+        assert plan_pro.is_pro
+        assert plan_pro.max_queries_pm == UNLIMITED
+
+        plan_team = _build_entitlements({"pla": "o:team"})
+        assert plan_team.is_team
+        assert plan_team.is_pro
+        assert plan_team.pdf_export
+
+    def test_clerk_public_metadata(self):
+        plan_meta = _build_entitlements({"public_metadata": {"plan": "pro"}})
+        assert plan_meta.is_pro
+        assert plan_meta.max_queries_pm == UNLIMITED

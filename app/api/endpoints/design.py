@@ -1,7 +1,7 @@
 """Schema Designer endpoints — generate a design, list history, report usage."""
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy import select
 
 from app.api.deps import UNLIMITED, CurrentUser, Plan, rate_limited, require_design_quota
@@ -52,8 +52,11 @@ async def get_design_history(user: CurrentUser, db: DbSession) -> list[DesignLog
 
 
 @router.get("/usage", response_model=UsageResponse)
-async def get_design_usage(user: CurrentUser, plan: Plan, db: DbSession) -> UsageResponse:
+async def get_design_usage(
+    response: Response, user: CurrentUser, plan: Plan, db: DbSession
+) -> UsageResponse:
     """This month's design count and the plan limit."""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return UsageResponse(
         used=await usage.count_designs_this_month(db, user.id),
         limit=plan.max_designs_pm,

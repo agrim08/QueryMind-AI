@@ -4,7 +4,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
@@ -87,6 +87,7 @@ async def run_query(
         outcome = PipelineOutcome()
         # Sign-in, ownership, the meter and context loading, before the pipeline starts.
         outcome.timings["setup"] = int((outcome.started - started) * 1000)
+        finished = False
         try:
             async for event in run_pipeline(
                 db,
@@ -100,10 +101,18 @@ async def run_query(
             ):
                 if event["type"] in _EVENTS_WITH_QUESTION_ID:
                     event = {**event, "question_id": str(log_id)}
+                if event["type"] == "done":
+                    # Commit the outcome to DB BEFORE yielding "done" so the client
+                    # sees the updated usage count immediately without race conditions.
+                    await query_meter.finish(log_id, outcome)
+                    finished = True
+                    yield event
+                    return
                 yield event
         finally:
-            # Runs even if the client disconnects mid-answer.
-            spawn(query_meter.finish(log_id, outcome), name="finish-question")
+            if not finished:
+                # Runs if the client disconnects mid-answer or stream errors before "done".
+                spawn(query_meter.finish(log_id, outcome), name="finish-question")
 
     return sse_response(events())
 
@@ -123,8 +132,11 @@ async def get_saved_answer(question_id: uuid.UUID, user: CurrentUser, db: DbSess
 
 
 @router.get("/usage", response_model=UsageResponse)
-async def get_question_usage(user: CurrentUser, plan: Plan, db: DbSession) -> UsageResponse:
+async def get_question_usage(
+    response: Response, user: CurrentUser, plan: Plan, db: DbSession
+) -> UsageResponse:
     """Questions asked this calendar month (UTC) and the plan's limit, for the usage meter."""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return UsageResponse(
         used=await usage.count_questions_this_month(db, user.id),
         limit=plan.max_queries_pm,

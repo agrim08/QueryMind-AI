@@ -12,7 +12,7 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
 # Google AI (new SDK — replaces deprecated google-generativeai)
-google-genai>=1.0.0
+google-genai>=1.63.0
 
 # Security / Encryption
 cryptography>=42.0.0

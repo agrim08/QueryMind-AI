@@ -12,4 +12,7 @@ from app.core.config import settings
 
 @lru_cache(maxsize=1)
 def get_genai_client() -> genai.Client:
-    return genai.Client(api_key=settings.GOOGLE_API_KEY)
+    return genai.Client(
+        api_key=settings.GOOGLE_API_KEY,
+        http_options={"api_version": "v1beta"},
+    )

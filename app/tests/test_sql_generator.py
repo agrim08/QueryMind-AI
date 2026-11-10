@@ -128,5 +128,16 @@ class TestGenerationSettings:
         assert "rolling window ending now, not the previous calendar year" in SYSTEM_PROMPT
         assert "add an Assumption saying the window" in SYSTEM_PROMPT
 
+    def test_listed_values_are_matched_exactly_and_names_by_a_stem(self):
+        # Eval p17 / c27: '%scifi%' missed 'Sci-Fi'; '%rock%' also counted 'Rock And Roll'.
+        # Eval c05 / p16: the whole misspelled word ('%zepelin%') matched nothing.
+        assert "compare with = and that exact spelling" in SYSTEM_PROMPT
+        assert "a short, distinctive part of each word" in SYSTEM_PROMPT
+
+    def test_repeats_and_never_questions_have_a_rule(self):
+        # Eval p15 (customers repeated without DISTINCT) and c35 (LEFT JOIN instead of NOT EXISTS).
+        assert "use DISTINCT or GROUP BY so each appears once" in SYSTEM_PROMPT
+        assert "use NOT EXISTS on the thing being asked about" in SYSTEM_PROMPT
+
     def test_no_schema_specific_hints(self):
         assert 'join with the "users" table' not in SYSTEM_PROMPT

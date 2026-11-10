@@ -141,6 +141,18 @@ non-empty look-alikes (analytics marts), where business definitions decide which
 | 2026-10-04 | Baseline (partial: Gemini free tier allows 20 requests/day) | 8/11 (c01–c11) | not run | 2.2 s |
 | 2026-10-04 | Validator ignores `FROM` inside `EXTRACT(…)` and similar (re-scored from cache) | 9/11 (c01–c11) | not run | — |
 | 2026-10-05 | Core set; prompt: rolling time windows, LIMIT rule (1 Gemini refusal left pending) | 7/8 core | 4/6 core | 2.8 s |
+| 2026-10-09 | First complete run, all 68 questions (same prompt; filled in over 5 days) | 32/35 (91%) | 29/33 (88%) | 2.9 s |
+
+Failures on 2026-10-09: 4 of 7 are about text values: c05 and p16 (misspelled names), p17 (`'%scifi%'`
+misses `'Sci-Fi'`), c27 (`'%rock%'` also counts "Rock And Roll"). Two are SQL logic: c35 (a LEFT JOIN
+where `NOT EXISTS` was needed) and p15 (no `DISTINCT`, so customers repeat). p10 used the
+`sales_by_store` view, which gives different numbers.
+
+Fixes made the same day (re-run in progress; the prompt and table documents changed, so every
+question is asked again over ~5 days): category columns show all their values (up to 25) instead of
+the first 12, which had hidden 'Sci-Fi' and 'Rock'; prompt rules for exact matching of listed
+values and stem matching of names, `DISTINCT` for repeated rows, and `NOT EXISTS` for "never"
+questions.
 
 Baseline failures: c05 typo in a name (`ILIKE '%zepelin%'`), c08 valid `EXTRACT(YEAR FROM …)`
 rejected by the validator's table check (fixed), c09 "top 5" answered with `LIMIT 500`.

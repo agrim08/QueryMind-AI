@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
-from app.api.deps import CurrentUser, Plan, rate_limited
+from app.api.deps import UNLIMITED, CurrentUser, Plan, rate_limited
 from app.core import errors
 from app.core.background import spawn
 from app.core.exceptions import InvalidInput
@@ -20,10 +20,11 @@ from app.schemas.schemas import (
     QueryHistoryResponse,
     QueryLogResponse,
     QueryRequest,
+    UsageResponse,
     VerifiedQueryResponse,
 )
 from app.services import connections as connection_service
-from app.services import answer_snapshot, knowledge, query_meter, question_context, verified_queries
+from app.services import answer_snapshot, knowledge, query_meter, question_context, usage, verified_queries
 from app.services.query_pipeline import PipelineOutcome, run_pipeline
 from app.services.reply_format import parse_reply
 
@@ -119,6 +120,16 @@ async def get_saved_answer(question_id: uuid.UUID, user: CurrentUser, db: DbSess
     """The answer saved when the question was asked, for History. 404 if the question isn't
     the user's or has no saved answer (not answered with rows, or asked before snapshots)."""
     return AnswerSnapshotResponse.model_validate(await answer_snapshot.get(db, user.id, question_id))
+
+
+@router.get("/usage", response_model=UsageResponse)
+async def get_question_usage(user: CurrentUser, plan: Plan, db: DbSession) -> UsageResponse:
+    """Questions asked this calendar month (UTC) and the plan's limit, for the usage meter."""
+    return UsageResponse(
+        used=await usage.count_questions_this_month(db, user.id),
+        limit=plan.max_queries_pm,
+        unlimited=plan.max_queries_pm >= UNLIMITED,
+    )
 
 
 @router.get("/history", response_model=QueryHistoryResponse)

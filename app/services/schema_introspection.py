@@ -35,7 +35,9 @@ INTROSPECTION_TIMEOUT_MS = 15_000
 SMALL_TABLE_ROWS = 200
 # A text column gets example values only if it has at most this many distinct values.
 MAX_DISTINCT_VALUES = 25
-SHOWN_VALUES = 12
+# All of them are shown (was 12, raised 2026-10-09 with approval): a cut list hid 'Sci-Fi' and
+# 'Rock', and the model guessed '%scifi%' / '%rock%' (eval cases p17, c27).
+SHOWN_VALUES = MAX_DISTINCT_VALUES
 VALUE_MAX_CHARS = 40
 
 # Schemas managed by Postgres itself or by hosting platforms (Supabase, TimescaleDB, PostGIS

@@ -118,15 +118,26 @@ class TestValuesFromStatistics:
     def test_long_values_are_free_text_not_categories(self):
         assert values_from_statistics(["x" * 41], 3, 100) == ((), 0)
 
-    def test_at_most_shown_values(self):
+    def test_every_value_of_a_category_column_is_shown(self):
         values = [f"v{i}" for i in range(20)]
-        shown, more = values_from_statistics(values, 20, 1_000)
-        assert len(shown) == SHOWN_VALUES and more == 20 - SHOWN_VALUES
+        assert values_from_statistics(values, 20, 1_000) == (tuple(values), 0)
+
+    def test_at_most_shown_values(self):
+        values = [f"v{i}" for i in range(SHOWN_VALUES + 5)]
+        shown, more = values_from_statistics(values, SHOWN_VALUES, 1_000)
+        assert len(shown) == SHOWN_VALUES and more == 0
 
 
 class TestValuesFromRows:
     def test_most_common_first_then_alphabetical(self):
         assert values_from_rows(["b", "a", "b", None, "", "c"], unique_allowed=True) == (("b", "a", "c"), 0)
+
+    def test_a_full_lookup_table_shows_every_spelling(self):
+        # Eval p17: with 12 shown, Pagila's 16 categories hid 'Sci-Fi' and the model guessed '%scifi%'.
+        categories = ["Action", "Animation", "Children", "Classics", "Comedy", "Documentary", "Drama", "Family",
+                      "Foreign", "Games", "Horror", "Music", "New", "Sci-Fi", "Sports", "Travel"]
+        shown, more = values_from_rows(categories, unique_allowed=True)
+        assert "Sci-Fi" in shown and more == 0
 
     def test_lookup_table_names_are_kept(self):
         assert values_from_rows(["Action", "Comedy", "Sci-Fi"], unique_allowed=True)[0] == ("Action", "Comedy", "Sci-Fi")

@@ -1,5 +1,4 @@
 """FastAPI application entry point."""
-import logging
 from contextlib import asynccontextmanager
 
 import sentry_sdk
@@ -11,12 +10,10 @@ from fastapi.responses import JSONResponse
 from app.api.endpoints import auth, connections, design, knowledge, query
 from app.core.config import settings
 from app.core.exceptions import DomainError
+from app.core.request_id import RequestIdMiddleware, configure_logging
 from app.db.session import engine
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+configure_logging()
 
 if settings.SENTRY_DSN:
     # send_default_pii=False: request bodies/headers can carry connection strings
@@ -53,6 +50,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Added last, so it is the outermost layer: every response and log line gets the id.
+app.add_middleware(RequestIdMiddleware)
 
 
 @app.exception_handler(DomainError)

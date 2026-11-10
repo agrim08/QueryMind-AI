@@ -304,3 +304,12 @@ class TestSavedAnswer:
 def test_requests_without_a_token_are_rejected():
     response = TestClient(app).get("/api/v1/connections/")
     assert response.status_code in (401, 403)
+
+
+def test_question_usage_counts_this_month_against_the_plan(client, monkeypatch):
+    async def count(session, user_id):
+        assert user_id == USER.id
+        return 12
+
+    monkeypatch.setattr(query_endpoint.usage, "count_questions_this_month", count)
+    assert client.get("/api/v1/query/usage").json() == {"used": 12, "limit": 50, "unlimited": False}

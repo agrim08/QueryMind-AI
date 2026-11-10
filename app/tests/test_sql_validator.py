@@ -216,3 +216,39 @@ class TestKnownTablesSchemaQualified:
     )
     def test_unlisted_tables_are_rejected(self, sql):
         assert not validate_sql(sql, known_tables=self.KNOWN).is_valid
+
+
+class TestCommonTableExpressions:
+    """WITH … SELECT is allowed (approved 2026-10-09, known gap #20); writes inside CTEs are not."""
+
+    KNOWN = ["invoice", "invoice_line", "track", "genre"]
+
+    @pytest.mark.parametrize("sql", [
+        'WITH monthly AS (SELECT date_trunc(\'month\', "invoice_date") AS m, SUM("total") AS t FROM "invoice" GROUP BY 1) '
+        'SELECT m, t FROM monthly ORDER BY m',
+        "WITH a AS (SELECT genre_id FROM track), b AS (SELECT genre_id FROM genre) SELECT * FROM a JOIN b USING (genre_id)",
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n",
+        'WITH "Sales" AS MATERIALIZED (SELECT * FROM invoice) SELECT * FROM "Sales"',
+        "with lower_case as (select * from invoice) select count(*) from lower_case",
+    ])
+    def test_read_only_ctes_are_accepted(self, sql):
+        assert validate_sql(sql, known_tables=self.KNOWN).is_valid
+
+    @pytest.mark.parametrize("sql", [
+        "WITH gone AS (DELETE FROM invoice RETURNING *) SELECT * FROM gone",
+        "WITH x AS (SELECT 1) INSERT INTO invoice SELECT * FROM x",
+        "WITH x AS (UPDATE invoice SET total = 0 RETURNING *) SELECT * FROM x",
+        "WITH x AS (SELECT * FROM invoice) SELECT * INTO copy FROM x",
+        "WITH x AS (SELECT pg_sleep(10)) SELECT * FROM x",
+    ])
+    def test_writes_and_side_effects_inside_ctes_are_rejected(self, sql):
+        assert not validate_sql(sql, known_tables=self.KNOWN).is_valid
+
+    def test_unknown_tables_inside_a_cte_are_still_rejected(self):
+        result = validate_sql("WITH x AS (SELECT * FROM secrets) SELECT * FROM x", known_tables=self.KNOWN)
+        assert not result.is_valid and result.unknown_tables == ("secrets",)
+
+    def test_a_cte_name_only_counts_when_the_query_starts_with_with(self):
+        # Without a WITH clause, "monthly" is just an unknown table.
+        result = validate_sql("SELECT * FROM monthly", known_tables=self.KNOWN)
+        assert not result.is_valid and result.unknown_tables == ("monthly",)

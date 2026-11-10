@@ -1,7 +1,9 @@
 """SQL Validator — keyword blocklist + sqlparse structural check.
 
 Hard rules:
-- Only SELECT statements are allowed.
+- Only SELECT statements are allowed, optionally starting with read-only CTEs
+  (WITH name AS (SELECT …) SELECT …). A CTE that writes (WITH x AS (DELETE … RETURNING …)) is
+  caught by the blocklist, which scans the whole statement.
 - Blocklist covers all mutating / DDL keywords, SELECT ... INTO, row locks,
   and side-effecting functions (pg_terminate_backend, pg_sleep, dblink, ...).
 - This is one layer of several: the executor also runs inside a READ ONLY transaction.
@@ -64,6 +66,22 @@ _FROM_ARGUMENT_FUNCTION_PATTERN = re.compile(r"\b(?:EXTRACT|SUBSTRING|TRIM|OVERL
 _DISTINCT_FROM_PATTERN = re.compile(r"\bDISTINCT\s+FROM\b", re.IGNORECASE)
 _STRING_LITERAL_PATTERN = re.compile(r"'(?:[^']|'')*'")
 
+# CTE names: `WITH [RECURSIVE] name [(cols)] AS [NOT] [MATERIALIZED] (` and `, name … AS (`.
+# Only read when the statement starts with WITH; they are query-local names, not tables.
+_CTE_NAME_PATTERN = re.compile(
+    r"(?:\bWITH\s+(?:RECURSIVE\s+)?|,\s*)(\"[^\"]+\"|\w+)\s*(?:\([^()]*\)\s*)?"
+    r"AS\s+(?:NOT\s+)?(?:MATERIALIZED\s+)?\(",
+    re.IGNORECASE,
+)
+
+
+def cte_names(sql: str) -> set[str]:
+    """The (lowercased) names a WITH clause defines, so the table check doesn't flag them."""
+    text = _STRING_LITERAL_PATTERN.sub("''", sql)
+    if not re.match(r"\s*WITH\b", text, re.IGNORECASE):
+        return set()
+    return {name.strip('"').lower() for name in _CTE_NAME_PATTERN.findall(text)}
+
 
 def _without_expression_from(sql: str) -> str:
     """The SQL with every FROM that doesn't introduce a table blanked out (only for the table check).
@@ -117,7 +135,7 @@ def _extract_keywords(statement: Statement) -> list[str]:
     """Return all keyword token values (upper-cased) from a parsed statement."""
     keywords: list[str] = []
     for token in statement.flatten():
-        if token.ttype in (Keyword, DDL, DML):
+        if token.ttype in (Keyword, Keyword.CTE, DDL, DML):
             keywords.append(token.normalized.upper())
     return keywords
 
@@ -185,7 +203,10 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
     statement = parsed[0]
     keywords = _extract_keywords(statement)
 
-    if not keywords or keywords[0] != "SELECT":
+    # A plain SELECT, or WITH … SELECT (approved 2026-10-09, known gap #20). Writes inside a CTE
+    # never get here: their keywords are on the blocklist above.
+    is_select = bool(keywords) and (keywords[0] == "SELECT" or (keywords[0] == "WITH" and "SELECT" in keywords))
+    if not is_select:
         return ValidationResult(
             is_valid=False,
             error=f"Only SELECT statements are allowed. Got: {keywords[0] if keywords else 'unknown'}",
@@ -194,8 +215,9 @@ def validate_sql(sql: str, known_tables: list[str] | None = None) -> ValidationR
     # --- 3. Optional: verify referenced tables exist in schema ---
     if known_tables:
         # Known tables are display names: bare in `public` ("invoice"), schema.table elsewhere.
+        # A CTE's own name is query-local, so a bare reference to it is fine.
         known_lower = {t.lower() for t in known_tables}
-        known_bare = {t.split(".")[-1] for t in known_lower}
+        known_bare = {t.split(".")[-1] for t in known_lower} | cte_names(sql)
         unknown = set()
         for parts in table_references(sql):
             if len(parts) == 1:
